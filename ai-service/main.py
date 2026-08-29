@@ -52,7 +52,7 @@ except ImportError:
 import numpy as np
 try:
     import faiss
-    from sentence_transformers import SentenceTransformer
+    from fastembed import TextEmbedding
     HAS_RAG = True
 except ImportError:
     HAS_RAG = False
@@ -86,8 +86,8 @@ ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".csv"}
 embed_model = None
 if HAS_RAG:
     try:
-        print("Loading local embedding model (all-MiniLM-L6-v2)...")
-        embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("Loading local embedding model (all-MiniLM-L6-v2) via fastembed...")
+        embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
         print("Embedding model loaded successfully.")
     except Exception as e:
         print(f"Failed to load embedding model: {e}")
@@ -125,14 +125,14 @@ def retrieve_context(text: str, k: int = 8) -> tuple:
     if not chunks:
         return text[:12000], 0.0
 
-    embeddings = np.array(embed_model.encode(chunks, show_progress_bar=False)).astype('float32')
+    embeddings = np.array(list(embed_model.embed(chunks))).astype('float32')
 
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
 
     query = ("Identify financial risks, operational delays, technical vulnerabilities, "
              "legal liabilities, compliance issues, and critical roadblocks.")
-    query_embedding = embed_model.encode([query]).astype('float32')
+    query_embedding = np.array(list(embed_model.embed([query]))).astype('float32')
 
     actual_k = min(k, len(chunks))
     distances, indices = index.search(query_embedding, actual_k)
@@ -177,9 +177,7 @@ def _rebuild_index(project_id: str, chunks_meta: list):
             json.dump([], f)
         return
 
-    embeddings = np.array(
-        embed_model.encode([c["text"] for c in chunks_meta], show_progress_bar=False)
-    ).astype('float32')
+    embeddings = np.array(list(embed_model.embed([c["text"] for c in chunks_meta]))).astype('float32')
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
     faiss.write_index(index, str(index_path))
@@ -215,7 +213,7 @@ def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str
         _rebuild_index(project_id, kept + new_meta)
         return
 
-    embeddings = np.array(embed_model.encode(chunks, show_progress_bar=False)).astype('float32')
+    embeddings = np.array(list(embed_model.embed(chunks))).astype('float32')
 
     if index_path.exists():
         index = faiss.read_index(str(index_path))
@@ -271,7 +269,7 @@ def query_knowledge_base(project_id: str, question: str, k: int = 8):
     if not chunks_meta:
         return []
 
-    query_embedding = embed_model.encode([question]).astype('float32')
+    query_embedding = np.array(list(embed_model.embed([question]))).astype('float32')
     actual_k = min(k, len(chunks_meta))
     if actual_k == 0:
         return []
