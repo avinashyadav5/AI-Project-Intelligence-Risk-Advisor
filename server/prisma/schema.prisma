@@ -1,0 +1,212 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  password  String
+  role      String   @default("developer") // admin, pm, developer, auditor
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  projects  ProjectMembers[]
+  logs      ActivityLog[]
+  notifications Notification[]
+  groupMessages GroupMessage[]
+}
+
+model Project {
+  id           String        @id @default(uuid())
+  name         String
+  description  String
+  ownerId      String?
+  documents    Document[]
+  chatMessages ChatMessage[]
+  groupMessages GroupMessage[]
+  members      ProjectMembers[]
+  invites      Invite[]
+  milestones   Milestone[]
+  healthHistory ProjectHealthHistory[]
+  activityLogs ActivityLog[]
+  
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model ProjectMembers {
+  id        String   @id @default(uuid())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  role      String   // pm, developer, auditor
+  joinedAt  DateTime @default(now())
+
+  @@unique([projectId, userId])
+}
+
+model Invite {
+  id        String   @id @default(uuid())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  email     String
+  role      String
+  token     String   @unique
+  used      Boolean  @default(false)
+  createdBy String
+  expiry    DateTime
+  createdAt DateTime @default(now())
+}
+
+model Milestone {
+  id          String   @id @default(uuid())
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId   String
+  name        String
+  description String?
+  status      String   @default("pending") // pending, in_progress, completed, blocked
+  dueDate     DateTime?
+  progress    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  dependencies TaskDependency[] @relation("DependsOn")
+  dependents   TaskDependency[] @relation("Dependent")
+}
+
+model TaskDependency {
+  id            String   @id @default(uuid())
+  taskId        String
+  dependsOnId   String
+  
+  task          Milestone @relation("Dependent", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOn     Milestone @relation("DependsOn", fields: [dependsOnId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, dependsOnId])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  type      String   // risk, deadline, invite, alert
+  message   String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+model ProjectHealthHistory {
+  id            String   @id @default(uuid())
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId     String
+  planningScore Int      @default(100)
+  docsScore     Int      @default(100)
+  devScore      Int      @default(100)
+  testScore     Int      @default(100)
+  riskScore     Int      @default(0)
+  overallScore  Int      @default(100)
+  createdAt     DateTime @default(now())
+}
+
+model ActivityLog {
+  id        String   @id @default(uuid())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId    String?
+  action    String
+  details   Json?
+  createdAt DateTime @default(now())
+}
+
+model Document {
+  id               String   @id @default(uuid())
+  project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId        String
+  filename         String
+  originalName     String
+  fileType         String?
+  size             Int?
+  uploadDate       DateTime @default(now())
+  status           String   @default("Uploaded")
+
+  analysisSource   String?
+  summary          String?
+  extractedText    String?
+  wordCount        Int      @default(0)
+  riskScore        Int?
+  riskLevel        String?
+  keyInsights      Json     @default("[]")
+  recommendations  Json     @default("[]")
+  riskCategories   Json     @default("{}") // Advanced AI Agents Outputs
+  scope            Json?
+  deliverables     Json     @default("[]")
+  blockers         Json     @default("[]")
+  scheduleForecast Json?
+  userStories      Json     @default("[]")
+  riskRegister     Json     @default("[]")
+  projectHealth    Json?
+  confidence       Json?
+  
+  missingDocs      Json     @default("[]")
+  traceability     Json     @default("[]")
+  sprintSummary    String?
+  meetingMinutes   String?
+  decisions        Json     @default("[]")
+  actionItems      Json     @default("[]")
+
+  processingTimeMs Int?
+  errorMessage     String?
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([riskLevel])
+  @@index([createdAt])
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  role      String   
+  content   String
+  sources   Json     @default("[]")
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+}
+
+model AlertLog {
+  id         String   @id @default(uuid())
+  documentId String
+  projectId  String
+  riskScore  Int
+  riskLevel  String
+  alertType  String   
+  message    String
+  createdAt  DateTime @default(now())
+
+  @@index([projectId])
+}
+
+model GroupMessage {
+  id        String   @id @default(uuid())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  sender    User     @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  senderId  String
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+  @@index([createdAt])
+}

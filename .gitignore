@@ -1,0 +1,42 @@
+﻿# ─── Environment & Secrets ───────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Node.js ─────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+
+# ─── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ─── FAISS Knowledge Base (large binary indexes) ─────────────────────
+knowledge_base/
+ai-service/knowledge_base/
+
+# ─── Uploaded files (user content, not code) ─────────────────────────
+uploads/
+server/uploads/
+ai-service/uploads/
+
+# ─── React / Vite Build Output ───────────────────────────────────────
+client/dist/
+
+# ─── OS files ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── IDE / Editor ────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ─── Logs ────────────────────────────────────────────────────────────
+logs/
+*.log
