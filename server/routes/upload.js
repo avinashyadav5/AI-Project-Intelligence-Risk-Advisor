@@ -2,11 +2,14 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const path = require('path');
-const axios = require('axios');
-
 const FormData = require('form-data');
 const fs = require('fs');
+
 const prisma = require('../prismaClient');
+const auth = require('../middleware/auth');
+const { requireProjectAccess, requireRole } = require('../middleware/auth');
+const ai = require('../utils/aiService');
+const events = require('../utils/events');
 
 // ── Multer config ─────────────────────────────────────────────────────────────
 const storage = multer.diskStorage({
@@ -21,170 +24,251 @@ const storage = multer.diskStorage({
   },
 });
 
+const ALLOWED_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt', '.csv'];
+
 const upload = multer({
   storage,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
   fileFilter: (req, file, cb) => {
-    const allowed = ['.pdf', '.doc', '.docx', '.txt', '.csv'];
     const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(ext)) {
+    if (ALLOWED_EXTENSIONS.includes(ext)) {
       cb(null, true);
     } else {
-      cb(new Error(`File type ${ext} not allowed`), false);
+      cb(new Error(`File type ${ext} is not supported. Upload a PDF, Word, text or CSV file.`), false);
     }
   },
 });
 
-const FASTAPI_URL = process.env.FASTAPI_URL || 'http://127.0.0.1:8000';
+/**
+ * Multer rejects files inside middleware, so its errors never reached the
+ * route handler's try/catch — a file over the limit returned a raw HTML 500.
+ * Wrapping the middleware turns those into the JSON the client expects.
+ */
+function handleUpload(req, res, next) {
+  upload.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'File is too large. The maximum size is 50MB.' });
+    }
+    return res.status(400).json({ error: err.message || 'Upload failed.' });
+  });
+}
 
-// ── Helper: trigger AI analysis in background ─────────────────────────────────
-// WHY store filePath in closure: by the time setImmediate fires, req.file is
-// still in scope but the file is already on disk — safe to create a new ReadStream.
-async function triggerAnalysis(docId, filePath, originalName, projectId, plan) {
+// ── Background analysis ───────────────────────────────────────────────────────
+// filePath is captured in the closure: by the time setImmediate fires the file
+// is already on disk, so a fresh ReadStream is safe.
+async function triggerAnalysis(docId, filePath, originalName, projectId, userId) {
   try {
-    // Update status to Processing first
     await prisma.document.update({
       where: { id: docId },
-      data: { status: 'Processing' }
+      data: { status: 'Processing' },
     });
 
     const form = new FormData();
     form.append('file', fs.createReadStream(filePath), originalName);
     form.append('projectId', projectId);
-    form.append('plan', plan);
+    // The document id travels with the file so its knowledge-base chunks are
+    // attributable — chat citations name the real document, and re-uploading
+    // replaces the old chunks instead of duplicating them.
+    form.append('documentId', docId);
 
-    const aiResponse = await axios.post(`${FASTAPI_URL}/analyze`, form, {
+    const aiResponse = await ai.post('/analyze', form, {
       headers: form.getHeaders(),
-      timeout: 300000, // 300s — Groq rate limit (429) backoffs can take several minutes
+      timeout: 300000, // Groq 429 backoffs can take several minutes
     });
 
-    const ai = aiResponse.data;
+    const data = aiResponse.data;
 
     await prisma.document.update({
       where: { id: docId },
       data: {
         status: 'Analyzed',
-        analysisSource: ai.analysis_source || 'groq',
-        summary: ai.summary || null,
-        extractedText: ai.extracted_text ? ai.extracted_text.substring(0, 5000) : null,
-        wordCount: ai.word_count || 0,
-        riskScore: typeof ai.risk_score === 'number' ? ai.risk_score : null,
-        riskLevel: ai.risk_level || null,
-        keyInsights: Array.isArray(ai.key_insights) ? ai.key_insights : [],
-        recommendations: Array.isArray(ai.recommendations) ? ai.recommendations : [],
-        riskCategories: ai.risk_categories || {},
-        scope: ai.scope || null,
-        deliverables: ai.deliverables || [],
-        blockers: ai.blockers || [],
-        scheduleForecast: ai.schedule_forecast || null,
-        userStories: ai.user_stories || [],
-        riskRegister: ai.risk_register || [],
-        projectHealth: ai.project_health || null,
-        confidence: typeof ai.confidence_score === 'number' ? ai.confidence_score : null,
-        
-        missingDocs: ai.missing_documentation || [],
-        traceability: ai.traceability_gaps || [],
-        sprintSummary: typeof ai.sprint_summary === 'object' ? JSON.stringify(ai.sprint_summary) : (ai.sprint_summary || null),
-        meetingMinutes: ai.meeting_minutes || null,
-        decisions: ai.decisions || [],
-        actionItems: ai.action_items || [],
-        
-        processingTimeMs: ai.processing_time_ms || null,
+        analysisSource: data.analysis_source || 'groq',
+        summary: data.summary || null,
+        extractedText: data.extracted_text ? data.extracted_text.substring(0, 5000) : null,
+        wordCount: data.word_count || 0,
+        riskScore: typeof data.risk_score === 'number' ? data.risk_score : null,
+        riskLevel: data.risk_level || null,
+        keyInsights: Array.isArray(data.key_insights) ? data.key_insights : [],
+        recommendations: Array.isArray(data.recommendations) ? data.recommendations : [],
+        riskCategories: data.risk_categories || {},
+        scope: data.scope || null,
+        deliverables: data.deliverables || [],
+        blockers: data.blockers || [],
+        scheduleForecast: data.schedule_forecast || null,
+        userStories: data.user_stories || [],
+        riskRegister: data.risk_register || [],
+        projectHealth: data.project_health || null,
+        confidence: typeof data.confidence_score === 'number' ? data.confidence_score : null,
+
+        missingDocs: data.missing_documentation || [],
+        traceability: data.traceability_gaps || [],
+        sprintSummary: typeof data.sprint_summary === 'object'
+          ? JSON.stringify(data.sprint_summary)
+          : (data.sprint_summary || null),
+        meetingMinutes: data.meeting_minutes || null,
+        decisions: data.decisions || [],
+        actionItems: data.action_items || [],
+
+        processingTimeMs: data.processing_time_ms || null,
         errorMessage: null,
-      }
+      },
     });
 
-    console.log(`✅ Analyzed doc ${docId}: ${ai.risk_level} (score: ${ai.risk_score})`);
-    
-    // Simulate Email/Slack Alert on Critical Risk
-    if (ai.risk_score >= 70) {
-      const msg = `🚨 CRITICAL RISK ALERT: Document "${originalName}" scored ${ai.risk_score}/100. Immediate attention required.`;
-      console.log('\n=============================================');
-      console.log(msg);
-      console.log('=============================================\n');
+    console.log(`Analyzed document ${docId}: ${data.risk_level} (score: ${data.risk_score})`);
+
+    await events.logActivity(projectId, userId, 'document.analyzed', {
+      documentId: docId,
+      name: originalName,
+      riskLevel: data.risk_level,
+      riskScore: data.risk_score,
+      healthScore: data.project_health?.score ?? null,
+    });
+
+    await events.recordHealthSnapshot(projectId, {
+      health: data.project_health,
+      riskScore: data.risk_score,
+    });
+
+    await events.notifyProject(projectId, {
+      type: 'analysis',
+      message: `Analysis finished for "${originalName}" — ${data.risk_level || 'Unknown'} risk.`,
+      link: `/report/${docId}`,
+    });
+
+    // High-risk documents raise a real notification for the whole team rather
+    // than only writing a console line.
+    if (typeof data.risk_score === 'number' && data.risk_score >= 70) {
+      const message = `Critical risk: "${originalName}" scored ${data.risk_score}/100 and needs attention.`;
       await prisma.alertLog.create({
         data: {
           documentId: docId,
           projectId,
-          riskScore: ai.risk_score,
-          riskLevel: ai.risk_level || 'High',
-          alertType: 'slack',
-          message: msg
-        }
+          riskScore: data.risk_score,
+          riskLevel: data.risk_level || 'High',
+          alertType: 'in_app',
+          message,
+        },
+      });
+      await events.notifyProject(projectId, {
+        type: 'risk',
+        message,
+        link: `/report/${docId}`,
+      });
+      await events.logActivity(projectId, userId, 'risk.critical', {
+        documentId: docId,
+        riskScore: data.risk_score,
       });
     }
-
   } catch (err) {
-    const msg = err.response?.data?.detail || err.message || 'Unknown error';
-    console.error(`❌ Analysis failed for doc ${docId}:`, msg);
+    const message = err.response?.data?.detail || err.message || 'Unknown error';
+    console.error(`Analysis failed for document ${docId}:`, message);
     await prisma.document.update({
       where: { id: docId },
-      data: {
-        status: 'Failed',
-        errorMessage: msg,
-      }
-    });
+      data: { status: 'Failed', errorMessage: message },
+    }).catch(e => console.error('Could not mark document as failed:', e.message));
   }
 }
 
 // ── POST /api/upload ──────────────────────────────────────────────────────────
-router.post('/', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+router.post(
+  '/',
+  auth,
+  handleUpload,
+  requireProjectAccess(req => req.body.projectId),
+  requireRole('pm', 'developer'),
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
-    const { projectId } = req.body;
-    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+      const projectId = req.projectId;
 
-    // Save document record with Uploaded status immediately
-    const doc = await prisma.document.create({
-      data: {
-        projectId,
-        filename: req.file.filename,
-        originalName: req.file.originalname,
-        fileType: req.file.mimetype,
+      const doc = await prisma.document.create({
+        data: {
+          projectId,
+          filename: req.file.filename,
+          originalName: req.file.originalname,
+          fileType: req.file.mimetype,
+          size: req.file.size,
+          status: 'Uploaded',
+        },
+      });
+
+      // Respond immediately — analysis continues in the background.
+      res.status(200).json({
+        message: 'File uploaded. AI analysis is starting.',
+        document: doc,
+      });
+
+      await events.logActivity(projectId, req.user.id, 'document.uploaded', {
+        documentId: doc.id,
+        name: req.file.originalname,
         size: req.file.size,
-        status: 'Uploaded',
+      });
+
+      const { path: filePath, originalname } = req.file;
+      setImmediate(() => triggerAnalysis(doc.id, filePath, originalname, projectId, req.user.id));
+    } catch (err) {
+      console.error('Upload error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Internal server error during upload.' });
       }
-    });
-
-    // Respond immediately — fast upload UX
-    res.status(200).json({
-      message: 'File uploaded. Groq AI analysis starting...',
-      document: doc,
-    });
-
-    // Fire analysis asynchronously — captured values in closure, not req.file reference
-    const { path: filePath, originalname } = req.file;
-    setImmediate(() => triggerAnalysis(doc.id, filePath, originalname, projectId, "enterprise"));
-
-  } catch (err) {
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({ error: 'File too large. Maximum size is 50MB.' });
     }
-    console.error('Upload error:', err);
-    res.status(500).json({ error: 'Internal server error during upload' });
   }
-});
+);
 
 // ── GET /api/upload/project/:projectId ───────────────────────────────────────
-router.get('/project/:projectId', async (req, res) => {
-  try {
-    let documents = await prisma.document.findMany({
-      where: { projectId: req.params.projectId },
-      orderBy: { createdAt: 'desc' }
-    });
-    
-    // Exclude large text field from list as mongoose select('-extractedText') did
-    documents = documents.map(doc => {
-      const { extractedText, ...rest } = doc;
-      return rest;
-    });
-    
-    res.json(documents);
-  } catch (err) {
-    console.error('Error fetching documents:', err);
-    res.status(500).json({ error: 'Failed to fetch documents' });
+router.get(
+  '/project/:projectId',
+  auth,
+  requireProjectAccess(req => req.params.projectId),
+  async (req, res) => {
+    try {
+      const documents = await prisma.document.findMany({
+        where: { projectId: req.params.projectId },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      // Drop the bulky extracted text from list responses.
+      res.json(documents.map(({ extractedText, ...rest }) => rest));
+    } catch (err) {
+      console.error('Error fetching documents:', err);
+      res.status(500).json({ error: 'Failed to fetch documents.' });
+    }
   }
-});
+);
+
+// ── POST /api/upload/:id/reanalyze ───────────────────────────────────────────
+router.post(
+  '/:id/reanalyze',
+  auth,
+  requireProjectAccess(async (req) => {
+    const doc = await prisma.document.findUnique({
+      where: { id: req.params.id },
+      select: { projectId: true },
+    });
+    return doc?.projectId;
+  }),
+  requireRole('pm', 'developer'),
+  async (req, res) => {
+    try {
+      const doc = await prisma.document.findUnique({ where: { id: req.params.id } });
+      if (!doc) return res.status(404).json({ error: 'Document not found.' });
+
+      const filePath = path.join(__dirname, '../uploads', doc.filename);
+      if (!fs.existsSync(filePath)) {
+        return res.status(410).json({ error: 'The original file is no longer on the server.' });
+      }
+
+      res.json({ message: 'Re-analysis started.', documentId: doc.id });
+      setImmediate(() =>
+        triggerAnalysis(doc.id, filePath, doc.originalName, doc.projectId, req.user.id)
+      );
+    } catch (err) {
+      console.error('Re-analysis error:', err);
+      if (!res.headersSent) res.status(500).json({ error: 'Failed to start re-analysis.' });
+    }
+  }
+);
 
 module.exports = router;

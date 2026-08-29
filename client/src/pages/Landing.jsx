@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Shield, Zap, Target, Activity, ArrowRight, ShieldAlert, FileText, CheckCircle } from 'lucide-react';
+import { Shield, Zap, Target, Activity, ArrowRight, ShieldAlert, FileText } from 'lucide-react';
 
 const Landing = () => {
   return (

@@ -1,10 +1,14 @@
 {
-  "name": "server",
+  "name": "ai-project-risk-advisor-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Express API for the AI Project Intelligence & Risk Advisor",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "prisma:push": "prisma db push",
+    "prisma:generate": "prisma generate",
+    "prisma:studio": "prisma studio"
   },
   "keywords": [],
   "author": "",

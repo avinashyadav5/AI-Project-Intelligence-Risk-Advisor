@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useContext } from 'react';
 import { io } from 'socket.io-client';
-import { getProjectMessages } from '../services/api';
+import { getProjectMessages, SOCKET_URL } from '../services/api';
 import { AuthContext } from '../context/AuthContext';
 import { Send, User as UserIcon, ShieldAlert, Shield, Zap } from 'lucide-react';
 
@@ -9,6 +9,7 @@ const ProjectChat = ({ projectId }) => {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [socket, setSocket] = useState(null);
+  const [connectionError, setConnectionError] = useState('');
   const scrollContainerRef = useRef(null);
 
   useEffect(() => {
@@ -23,8 +24,12 @@ const ProjectChat = ({ projectId }) => {
     };
     fetchHistory();
 
-    // 2. Initialize Socket connection
-    const newSocket = io('http://localhost:5000');
+    // 2. Initialize an authenticated socket connection
+    const token = localStorage.getItem('token');
+    const newSocket = io(SOCKET_URL, {
+      auth: { token },
+      transports: ['websocket', 'polling'],
+    });
     setSocket(newSocket);
 
     // 3. Join the project room
@@ -32,8 +37,15 @@ const ProjectChat = ({ projectId }) => {
 
     // 4. Listen for incoming messages
     newSocket.on('new_message', (msg) => {
-      setMessages((prev) => [...prev, msg]);
+      setMessages((prev) => (prev.some(m => m.id === msg.id) ? prev : [...prev, msg]));
     });
+
+    newSocket.on('connect_error', (err) => {
+      setConnectionError(err.message || 'Could not connect to the chat server.');
+    });
+    newSocket.on('connect', () => setConnectionError(''));
+    newSocket.on('join_error', ({ error }) => setConnectionError(error));
+    newSocket.on('message_error', ({ error }) => setConnectionError(error));
 
     return () => {
       newSocket.disconnect();
@@ -53,7 +65,6 @@ const ProjectChat = ({ projectId }) => {
 
     socket.emit('send_message', {
       projectId,
-      senderId: user.id,
       content: newMessage,
     });
     setNewMessage('');
@@ -81,6 +92,12 @@ const ProjectChat = ({ projectId }) => {
           <span className="text-[10px] uppercase font-bold tracking-wider text-muted">Live</span>
         </div>
       </div>
+
+      {connectionError && (
+        <div className="px-4 py-2 bg-rose-50 border-b border-rose-100 text-xs text-rose-700">
+          {connectionError}
+        </div>
+      )}
 
       {/* Messages Area */}
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/50">
@@ -132,6 +149,7 @@ const ProjectChat = ({ projectId }) => {
             value={newMessage}
             onChange={(e) => setNewMessage(e.target.value)}
             placeholder="Type your message..."
+            aria-label="Message your team"
             className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-border rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
           />
           <button

@@ -1,99 +1,135 @@
 const express = require('express');
 const router = express.Router();
-const axios = require('axios');
 const prisma = require('../prismaClient');
+const auth = require('../middleware/auth');
+const { requireProjectAccess } = require('../middleware/auth');
+const ai = require('../utils/aiService');
 
-const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8000';
+/**
+ * Conversational assistant, grounded in the project knowledge base.
+ *
+ * Two things were broken here: the route had no auth (any caller could query
+ * another team's documents), and the conversation history was sent to the AI
+ * service in a field its request model didn't declare, so it was silently
+ * dropped and every question was answered cold.
+ */
 
-// GET /api/chat/:projectId - Get chat history
-router.get('/:projectId', async (req, res) => {
-  try {
-    const history = await prisma.chatMessage.findMany({
-      where: { projectId: req.params.projectId },
-      orderBy: { createdAt: 'asc' },
-    });
-    res.json(history);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch chat history' });
+// ── GET /api/chat/:projectId — conversation history ──────────────────────────
+router.get(
+  '/:projectId',
+  auth,
+  requireProjectAccess(req => req.params.projectId),
+  async (req, res) => {
+    try {
+      const history = await prisma.chatMessage.findMany({
+        where: { projectId: req.params.projectId },
+        orderBy: { createdAt: 'asc' },
+        take: 200,
+      });
+      res.json(history);
+    } catch (err) {
+      console.error('Chat history error:', err);
+      res.status(500).json({ error: 'Failed to fetch chat history.' });
+    }
   }
-});
+);
 
-// POST /api/chat - Send a question to the AI assistant
-router.post('/', async (req, res) => {
-  try {
+// ── DELETE /api/chat/:projectId — clear the thread ───────────────────────────
+router.delete(
+  '/:projectId',
+  auth,
+  requireProjectAccess(req => req.params.projectId),
+  async (req, res) => {
+    try {
+      const { count } = await prisma.chatMessage.deleteMany({
+        where: { projectId: req.params.projectId },
+      });
+      res.json({ message: 'Conversation cleared.', deleted: count });
+    } catch (err) {
+      console.error('Chat clear error:', err);
+      res.status(500).json({ error: 'Failed to clear the conversation.' });
+    }
+  }
+);
+
+// ── POST /api/chat — ask a question ──────────────────────────────────────────
+router.post(
+  '/',
+  auth,
+  requireProjectAccess(req => req.body.projectId),
+  async (req, res) => {
     const { projectId, question } = req.body;
-    if (!projectId || !question) {
-      return res.status(400).json({ error: 'projectId and question are required' });
+
+    if (!question || !String(question).trim()) {
+      return res.status(400).json({ error: 'A question is required.' });
     }
 
-    // Save user message
-    await prisma.chatMessage.create({
-      data: { projectId, role: 'user', content: question }
-    });
+    try {
+      // Read the prior turns BEFORE saving this one, so the current question
+      // isn't duplicated as both history and prompt.
+      const priorTurns = await prisma.chatMessage.findMany({
+        where: { projectId },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        select: { role: true, content: true },
+      });
+      const history = priorTurns.reverse().map(h => ({ role: h.role, content: h.content }));
 
-    // Fetch history
-    const historyData = await prisma.chatMessage.findMany({
-      where: { projectId },
-      orderBy: { createdAt: 'asc' },
-      take: 10 // last 10 messages for context
-    });
-    const history = historyData.map(h => ({ role: h.role, content: h.content }));
-
-    // First, try the FAISS-backed chat endpoint
-    let response = await axios.post(`${FASTAPI_URL}/chat`, {
-      project_id: projectId,
-      question: question,
-      history: history
-    }, { timeout: 60000 });
-
-    // If FAISS had no context, fall back to database text
-    if (response.data.grounded === false) {
-      console.log('⚠️ FAISS empty for project, falling back to DB text...');
-
-      // Fetch analyzed documents from PostgreSQL
-      const docs = await prisma.document.findMany({
-        where: { projectId, status: 'Analyzed' },
-        select: { extractedText: true, originalName: true, summary: true },
+      await prisma.chatMessage.create({
+        data: { projectId, role: 'user', content: question },
       });
 
-      if (docs.length > 0) {
-        // Build context from DB-stored text (cap at ~8000 chars to avoid token overflow)
-        const contextParts = docs.map(d => {
-          const text = d.extractedText || d.summary || '';
-          return `[Document: ${d.originalName}]\n${text.substring(0, 4000)}`;
+      let response = await ai.post('/chat', {
+        project_id: projectId,
+        question,
+        history,
+      }, { timeout: 60000 });
+
+      // If the knowledge base has nothing indexed, fall back to the extracted
+      // text stored in Postgres so the assistant still has something to work with.
+      if (response.data.grounded === false) {
+        console.log('Knowledge base empty for project, falling back to stored text.');
+
+        const docs = await prisma.document.findMany({
+          where: { projectId, status: 'Analyzed' },
+          select: { extractedText: true, originalName: true, summary: true },
         });
-        const dbContext = contextParts.join('\n\n---\n\n').substring(0, 8000);
 
-        // Call the fallback chat endpoint with DB context
-        response = await axios.post(`${FASTAPI_URL}/chat`, {
-          project_id: projectId,
-          question: question,
-          history: history,
-          context_override: dbContext,
-        }, { timeout: 60000 });
+        if (docs.length > 0) {
+          const dbContext = docs
+            .map(d => `[Document: ${d.originalName}]\n${(d.extractedText || d.summary || '').substring(0, 4000)}`)
+            .join('\n\n---\n\n')
+            .substring(0, 8000);
+
+          response = await ai.post('/chat', {
+            project_id: projectId,
+            question,
+            history,
+            context_override: dbContext,
+          }, { timeout: 60000 });
+        }
       }
+
+      await prisma.chatMessage.create({
+        data: {
+          projectId,
+          role: 'assistant',
+          content: response.data.answer,
+          sources: response.data.sources || [],
+        },
+      });
+
+      res.json(response.data);
+    } catch (err) {
+      console.error('Chat error:', err.message);
+      res.status(502).json({
+        error: 'The assistant could not be reached.',
+        answer: 'I could not process that question. Check that documents have been uploaded and analyzed for this project, then try again.',
+        sources: [],
+        grounded: false,
+      });
     }
-
-    // Save assistant message
-    await prisma.chatMessage.create({
-      data: {
-        projectId,
-        role: 'assistant',
-        content: response.data.answer,
-        sources: response.data.sources || []
-      }
-    });
-
-    res.json(response.data);
-  } catch (err) {
-    console.error('Chat error:', err.message);
-    res.status(500).json({ 
-      error: 'Chat failed',
-      answer: 'Sorry, I could not process your question. Please ensure documents have been uploaded and analyzed for this project.',
-      sources: [],
-      grounded: false
-    });
   }
-});
+);
 
 module.exports = router;

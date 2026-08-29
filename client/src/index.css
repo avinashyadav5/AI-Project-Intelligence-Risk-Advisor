@@ -695,3 +695,206 @@ body {
   color: #0f172a;
   border-color: #cbd5e1;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Accessibility, responsiveness and badge fixes
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Risk badges: case-insensitive ──────────────────────────────────────────
+   The badge rules were only written for capitalised values (.Low, .High), but
+   severity values arrive from the AI in lowercase ("critical", "high"), so
+   every severity badge in the risk table rendered with no colour at all. */
+.risk-badge.low       { background: #dcfce7; color: #16a34a; }
+.risk-badge.medium    { background: #fef9c3; color: #a16207; }
+.risk-badge.high      { background: #fee2e2; color: #dc2626; }
+.risk-badge.critical  { background: #fce7f3; color: #be185d; }
+.risk-badge.unknown   { background: #f1f5f9; color: #64748b; }
+.risk-badge.uploaded  { background: #e0e7ff; color: #4338ca; }
+.risk-badge.processing{ background: #fef3c7; color: #92400e; }
+.risk-badge.analyzed  { background: #dcfce7; color: #15803d; }
+.risk-badge.failed    { background: #fee2e2; color: #b91c1c; }
+
+/* ── Keyboard focus ─────────────────────────────────────────────────────────
+   Nothing in the app had a visible focus ring, so keyboard and screen-reader
+   users could not tell where they were. :focus-visible keeps the ring off for
+   mouse clicks. */
+:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+button:focus-visible,
+a:focus-visible,
+select:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 1px;
+}
+
+/* Skip link: lets keyboard users jump past the navigation. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 12px 20px;
+  background: #4f46e5;
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  border-radius: 0 0 8px 0;
+  text-decoration: none;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Reduced motion ─────────────────────────────────────────────────────────
+   The app uses spinners, pulses, pings and fade-ins. Respect the system
+   preference for people who get motion sickness or find them distracting. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Toasts ─────────────────────────────────────────────────────────────────
+   Replaces blocking window.alert() calls. */
+.toast-stack {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: min(380px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.14);
+  font-size: 14px;
+  line-height: 1.5;
+  color: #0f172a;
+  animation: toastIn 0.22s ease-out;
+}
+
+.toast.success { border-left: 4px solid #10b981; }
+.toast.error   { border-left: 4px solid #dc2626; }
+.toast.info    { border-left: 4px solid #6366f1; }
+
+.toast-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #94a3b8;
+  padding: 2px;
+  display: flex;
+  flex-shrink: 0;
+}
+
+.toast-close:hover { color: #475569; }
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Responsive layout ──────────────────────────────────────────────────────
+   Several pages used hardcoded pixel grid columns that could not reflow, so
+   content was cut off below roughly 900px. */
+.responsive-split {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 20px;
+  align-items: start;
+}
+
+.intel-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 1024px) {
+  .intel-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 900px) {
+  .responsive-split { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 768px) {
+  .toast-stack {
+    left: 16px;
+    right: 16px;
+    bottom: 16px;
+    max-width: none;
+  }
+
+  /* Wide tables scroll horizontally rather than overflowing the viewport. */
+  .table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .card { padding: 18px; }
+}
+
+/* Tap targets on touch devices need to be big enough to hit reliably. */
+@media (hover: none) and (pointer: coarse) {
+  button,
+  .nav-item,
+  .nav-item-h {
+    min-height: 40px;
+  }
+}
+
+/* ── Skeleton loading ───────────────────────────────────────────────────────
+   Replaces plain "Loading..." text, which gave no sense of what was coming
+   and let the layout jump when data arrived. */
+.skeleton-shimmer {
+  background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 50%, #e2e8f0 75%);
+  background-size: 200% 100%;
+  animation: skeletonShimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes skeletonShimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}

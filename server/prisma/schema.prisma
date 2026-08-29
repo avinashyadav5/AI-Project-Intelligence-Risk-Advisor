@@ -35,6 +35,8 @@ model Project {
   milestones   Milestone[]
   healthHistory ProjectHealthHistory[]
   activityLogs ActivityLog[]
+  generatedDocs GeneratedDocument[]
+  intelligence ProjectIntelligence[]
   
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
@@ -71,8 +73,11 @@ model Milestone {
   projectId   String
   name        String
   description String?
-  status      String   @default("pending") // pending, in_progress, completed, blocked
+  status      String   @default("not_started") // not_started, in_progress, completed, blocked
+  owner       String?
+  startDate   DateTime?
   dueDate     DateTime?
+  effort      String?
   progress    Int      @default(0)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -96,10 +101,14 @@ model Notification {
   id        String   @id @default(uuid())
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId    String
+  projectId String?
   type      String   // risk, deadline, invite, alert
   message   String
+  link      String?
   isRead    Boolean  @default(false)
   createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
 }
 
 model ProjectHealthHistory {
@@ -162,6 +171,12 @@ model Document {
   decisions        Json     @default("[]")
   actionItems      Json     @default("[]")
 
+  // Which action items the team has ticked off and which blockers they have
+  // dismissed. These were React state only, so a refresh silently reset them
+  // and no teammate ever saw the change.
+  completedActionItems Json  @default("[]")
+  dismissedBlockers    Json  @default("[]")
+
   processingTimeMs Int?
   errorMessage     String?
 
@@ -206,6 +221,58 @@ model GroupMessage {
   senderId  String
   content   String
   createdAt DateTime @default(now())
+
+  @@index([projectId])
+  @@index([createdAt])
+}
+
+
+// Documents the platform generated (user stories, risk register, SRS...).
+// Previously generation output was thrown away when the modal closed.
+model GeneratedDocument {
+  id        String   @id @default(uuid())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  docType   String   // user_stories, risk_register, action_items, srs, test_plan, status_report
+  title     String
+  markdown  String
+  sources   Json     @default("[]")
+  createdBy String?
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+  @@index([docType])
+}
+
+// Project-level run of the multi-agent pipeline over the unified knowledge
+// base — as opposed to Document, which holds a single file's analysis.
+model ProjectIntelligence {
+  id               String   @id @default(uuid())
+  project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId        String
+  riskScore        Int?
+  riskLevel        String?
+  healthScore      Int?
+  healthGrade      String?
+  confidence       Int?
+  summary          String?
+  scope            Json?
+  deliverables     Json     @default("[]")
+  blockers         Json     @default("[]")
+  riskRegister     Json     @default("[]")
+  riskCategories   Json     @default("{}")
+  projectHealth    Json?
+  scheduleForecast Json?
+  userStories      Json     @default("[]")
+  missingDocs      Json     @default("[]")
+  traceability     Json     @default("[]")
+  recommendations  Json     @default("[]")
+  sourceDocuments  Json     @default("[]")
+  documentsCovered Int      @default(0)
+  milestonesUsed   Int      @default(0)
+  analysisSource   String?
+  createdBy        String?
+  createdAt        DateTime @default(now())
 
   @@index([projectId])
   @@index([createdAt])

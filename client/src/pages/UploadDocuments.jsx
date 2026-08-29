@@ -1,9 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { getProjects, uploadFile, getProjectFiles, getDocument } from '../services/api';
+import { getProjects, uploadFile, getProjectFiles, getDocument, reanalyzeDocument, deleteDocument, errorMessage, API_BASE_URL } from '../services/api';
 import DocumentGeneratorModal from '../components/DocumentGeneratorModal';
-import { UploadCloud, FileText, CheckCircle, AlertCircle, RefreshCw, Eye, X, Wand2, Download, CheckSquare } from 'lucide-react';
+import { UploadCloud, FileText, CheckCircle, AlertCircle, RefreshCw, Eye, X, Wand2, Trash2, RotateCw } from 'lucide-react';
 import ProjectChat from '../components/ProjectChat';
+import ProjectIntelligence from '../components/ProjectIntelligence';
+import HealthTrend from '../components/HealthTrend';
+import TeamPanel from '../components/TeamPanel';
+import RiskAlerts from '../components/RiskAlerts';
+import TaskBoard from '../components/TaskBoard';
+import { useToast } from '../context/ToastContext';
 
 const STATUS_POLL_MS = 5000;
 
@@ -103,6 +109,42 @@ const UploadDocuments = () => {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const toast = useToast();
+  const [rowBusy, setRowBusy] = useState(null);
+  const [rowError, setRowError] = useState('');
+  const [confirmDeleteDoc, setConfirmDeleteDoc] = useState(null);
+
+  // Recovers a document whose analysis failed or was interrupted by a restart.
+  const handleReanalyze = async (doc) => {
+    setRowBusy(doc.id);
+    setRowError('');
+    try {
+      await reanalyzeDocument(doc.id);
+      setDocuments(prev => prev.map(d => (d.id === doc.id ? { ...d, status: 'Processing', errorMessage: null } : d)));
+      toast.info('Re-analysing ' + doc.originalName + '.');
+    } catch (err) {
+      setRowError(errorMessage(err, 'Could not restart the analysis.'));
+    } finally {
+      setRowBusy(null);
+    }
+  };
+
+  const handleDeleteDoc = async (doc) => {
+    setRowBusy(doc.id);
+    setRowError('');
+    try {
+      await deleteDocument(doc.id);
+      setDocuments(prev => prev.filter(d => d.id !== doc.id));
+      setConfirmDeleteDoc(null);
+      toast.success('Deleted ' + doc.originalName + '.');
+    } catch (err) {
+      setRowError(errorMessage(err, 'Could not delete the document.'));
+      setConfirmDeleteDoc(null);
+    } finally {
+      setRowBusy(null);
+    }
+  };
+
   const handleUpload = async (e) => {
     e.preventDefault();
     if (!file || !selectedProject || uploading) return;
@@ -130,7 +172,7 @@ const UploadDocuments = () => {
       const res = await getDocument(docId);
       setViewTextDoc(res.data);
     } catch (err) {
-      alert('Failed to load document content');
+      toast.error('Could not load that file.');
     } finally {
       setViewTextLoading(false);
     }
@@ -290,6 +332,21 @@ const UploadDocuments = () => {
         )}
       </div>
 
+        {/* ── Project-level intelligence, trend and team ── */}
+        {selectedProject && (
+          <>
+            <ProjectIntelligence projectId={selectedProject} />
+            <TaskBoard projectId={selectedProject} />
+            <div className="intel-grid">
+              <HealthTrend projectId={selectedProject} />
+              <div>
+                <TeamPanel projectId={selectedProject} />
+                <RiskAlerts projectId={selectedProject} />
+              </div>
+            </div>
+          </>
+        )}
+
         {/* ── Documents Table ── */}
         <div className="glass-panel rounded-2xl border border-slate-200 overflow-hidden">
           <div className="p-6 border-b border-slate-100 bg-white flex justify-between items-center">
@@ -313,6 +370,12 @@ const UploadDocuments = () => {
               </button>
             )}
           </div>
+
+          {rowError && (
+            <div className="px-6 py-3 bg-rose-50 border-b border-rose-100 text-sm text-rose-700">
+              {rowError}
+            </div>
+          )}
 
           {!selectedProject ? (
             <div className="text-center py-16 bg-slate-50">
@@ -395,6 +458,26 @@ const UploadDocuments = () => {
                           ) : doc.status === 'Failed' ? (
                             <span style={{ fontSize: 12, color: '#ef4444' }} title={doc.errorMessage}>Failed</span>
                           ) : null}
+
+                          {doc.status !== 'Processing' && (
+                            <button
+                              onClick={() => handleReanalyze(doc)}
+                              disabled={rowBusy === doc.id}
+                              title="Run the analysis again"
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 700, color: '#0891b2', padding: '4px 10px', background: '#ecfeff', border: 'none', cursor: rowBusy === doc.id ? 'wait' : 'pointer', borderRadius: 8, whiteSpace: 'nowrap' }}
+                            >
+                              <RotateCw size={12} /> Re-analyse
+                            </button>
+                          )}
+
+                          <button
+                            onClick={() => setConfirmDeleteDoc(doc)}
+                            disabled={rowBusy === doc.id}
+                            title="Delete this document"
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 700, color: '#b91c1c', padding: '4px 8px', background: '#fef2f2', border: 'none', cursor: 'pointer', borderRadius: 8 }}
+                          >
+                            <Trash2 size={12} />
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -406,6 +489,39 @@ const UploadDocuments = () => {
         </div>
       </div>
 
+      {confirmDeleteDoc && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 50, display: 'flex',
+          alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(15,23,42,0.4)', backdropFilter: 'blur(2px)', padding: 16,
+        }}>
+          <div className="card" style={{ maxWidth: 420, width: '100%' }}>
+            <h3 style={{ margin: '0 0 8px', fontSize: 16, fontWeight: 700 }}>
+              Delete "{confirmDeleteDoc.originalName}"?
+            </h3>
+            <p style={{ margin: '0 0 20px', fontSize: 14, color: '#64748b', lineHeight: 1.6 }}>
+              This removes the file, its analysis, and its content from the knowledge base,
+              so the assistant will stop answering from it.
+            </p>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setConfirmDeleteDoc(null)}
+                style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid #e2e8f0', background: '#fff', fontSize: 14, cursor: 'pointer', color: '#475569' }}
+              >
+                Keep document
+              </button>
+              <button
+                onClick={() => handleDeleteDoc(confirmDeleteDoc)}
+                disabled={rowBusy === confirmDeleteDoc.id}
+                style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: '#dc2626', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}
+              >
+                {rowBusy === confirmDeleteDoc.id ? 'Deleting...' : 'Delete document'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Document Generator Modal ── */}
       <DocumentGeneratorModal 
         isOpen={showGenModal} 
@@ -415,7 +531,12 @@ const UploadDocuments = () => {
 
       {/* ── Document Full Text Modal ── */}
       {(viewTextDoc || viewTextLoading) && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 md:p-8 fade-in">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 md:p-8 fade-in"
+          role="dialog"
+          aria-modal="true"
+          aria-label="File preview"
+          onClick={(e) => { if (e.target === e.currentTarget) setViewTextDoc(null); }}
+        >
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-5xl h-[85vh] flex flex-col overflow-hidden relative">
             {viewTextLoading ? (
               <div className="flex flex-col items-center justify-center py-24 text-center">
@@ -436,7 +557,7 @@ const UploadDocuments = () => {
                 <div className="flex-1 overflow-hidden bg-slate-100/50 flex flex-col">
                   {viewTextDoc.filename?.toLowerCase().endsWith('.pdf') ? (
                     <iframe
-                      src={`http://localhost:5000/uploads/${viewTextDoc.filename}`}
+                      src={`${API_BASE_URL.replace(/\/api\/?$/, '')}/uploads/${viewTextDoc.filename}`}
                       className="w-full h-full border-0"
                       title={viewTextDoc.originalName}
                     />

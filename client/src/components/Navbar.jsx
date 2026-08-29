@@ -2,14 +2,17 @@ import React, { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   LayoutDashboard, FolderKanban, UploadCloud,
-  ShieldAlert, Zap, Bell, User, MessageSquare, Menu, X
+  ShieldAlert, Zap, MessageSquare, Menu, X, BarChart3
 } from 'lucide-react';
+import NotificationBell from './NotificationBell';
+import UserMenu from './UserMenu';
 
 const navItems = [
   { to: '/dashboard',  label: 'Dashboard',       icon: LayoutDashboard },
   { to: '/projects',   label: 'Projects',        icon: FolderKanban },
   { to: '/upload',     label: 'Upload',          icon: UploadCloud },
   { to: '/reports',    label: 'Risk Reports',    icon: ShieldAlert },
+  { to: '/overview',   label: 'Overview',        icon: BarChart3 },
   { to: '/chat',       label: 'Chat',            icon: MessageSquare },
 ];
 
@@ -35,8 +38,10 @@ const Navbar = () => {
           className="hide-desktop" 
           style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4, display: 'none' }}
           onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+          aria-label={isMobileMenuOpen ? 'Close menu' : 'Open menu'}
+          aria-expanded={isMobileMenuOpen}
         >
-          <Menu size={24} color="#0f172a" />
+          {isMobileMenuOpen ? <X size={24} color="#0f172a" /> : <Menu size={24} color="#0f172a" />}
         </button>
         <style>{`
           @media (max-width: 768px) {
@@ -57,7 +62,7 @@ const Navbar = () => {
         </div>
         <div>
           <h1 className="brand-text-mobile" style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#0f172a', letterSpacing: '-0.3px', lineHeight: 1.1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '300px' }}>
-            Development of AI Powered Health Monitoring & Risk Analysis Platform
+            AI Project Intelligence &amp; Risk Advisor
           </h1>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }} className="hide-on-mobile-nav">
             <span style={{ fontSize: 10, color: '#6366f1', fontWeight: 700, letterSpacing: '0.5px', textTransform: 'uppercase' }}>
@@ -75,7 +80,7 @@ const Navbar = () => {
       </div>
 
       {/* Center: Navigation Links (Desktop) */}
-      <nav className="hide-on-mobile-nav" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <nav className="hide-on-mobile-nav" aria-label="Main" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         {navItems.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
@@ -97,23 +102,13 @@ const Navbar = () => {
           border: '1px solid #d1fae5'
         }}>
           <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#10b981', display: 'inline-block' }} />
-          Groq
+          AI ready
         </div>
 
         <div className="hide-on-mobile-nav" style={{ width: '1px', height: '24px', background: '#e2e8f0', margin: '0 4px' }} />
 
-        <button style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 8, color: '#64748b', borderRadius: 8, display: 'flex', transition: 'background 0.15s ease' }} onMouseOver={e => e.currentTarget.style.background = '#f1f5f9'} onMouseOut={e => e.currentTarget.style.background = 'none'}>
-          <Bell size={18} />
-        </button>
-        <button style={{
-          width: 36, height: 36, borderRadius: '50%',
-          background: 'linear-gradient(135deg, #eef2ff, #c7d2fe)',
-          border: '1px solid #a5b4fc', cursor: 'pointer', display: 'flex',
-          alignItems: 'center', justifyContent: 'center',
-          flexShrink: 0
-        }}>
-          <User size={18} color="#4f46e5" />
-        </button>
+        <NotificationBell />
+        <UserMenu />
       </div>
 
       {/* Mobile Menu Dropdown */}

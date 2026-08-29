@@ -1,15 +1,20 @@
 import React, { useState, useEffect } from 'react';
-import { CheckCircle, Clock, MessageSquare, Terminal, Plus, Code, ArrowRight, FileText } from 'lucide-react';
+import { CheckCircle, Clock, Plus, Code, ArrowRight, Lock, AlertTriangle, GitBranch } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import api from '../services/api';
+import { SkeletonBar, SkeletonStats, SkeletonList, LoadingRegion } from '../components/Skeleton';
+import api, { errorMessage } from '../services/api';
+import { useToast } from '../context/ToastContext';
+import JoinProjectModal from '../components/JoinProjectModal';
 
 export default function DeveloperDashboard() {
-  const [tasks, setTasks] = useState([]);
   const [projects, setProjects] = useState([]);
   const [stats, setStats] = useState({ myTasks: 0, deadlines: 0, tasks: [] });
   const [loading, setLoading] = useState(true);
   const [showTaskModal, setShowTaskModal] = useState(false);
-  const [newTask, setNewTask] = useState({ projectId: '', name: '', description: '' });
+  const [newTask, setNewTask] = useState({ projectId: '', name: '', description: '', dueDate: '', dependencies: [] });
+  const [showJoinModal, setShowJoinModal] = useState(false);
+  const [formError, setFormError] = useState('');
+  const toast = useToast();
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -30,39 +35,40 @@ export default function DeveloperDashboard() {
     fetchDashboardData();
   }, []);
 
-  const handleJoin = async () => {
-    const tokenInput = window.prompt("Paste your invite link or token to join a project:");
-    if (!tokenInput) return;
-
-    const token = tokenInput.includes('token=') ? new URL(tokenInput).searchParams.get('token') : tokenInput;
-
+  // Refreshes in place instead of a full page reload, which threw away all
+  // component state and flashed the whole app.
+  const refreshDashboard = async () => {
     try {
-      await api.post('/teams/join', { token });
-      alert("Successfully joined the project!");
-      window.location.reload(); // Refresh fully
+      const [projectsRes, statsRes] = await Promise.all([
+        api.get('/projects'),
+        api.get('/dashboard/stats'),
+      ]);
+      setProjects(projectsRes.data);
+      setStats(statsRes.data);
     } catch (error) {
-      alert("Failed to join project: " + (error.response?.data?.error || error.message));
+      console.error(error);
     }
   };
 
   const updateTaskStatus = async (taskId, newStatus) => {
     try {
-      await api.patch(`/milestones/${taskId}/progress`, { status: newStatus });
+      const res = await api.patch(`/milestones/${taskId}/progress`, { status: newStatus });
       setStats(prev => ({
         ...prev,
-        tasks: prev.tasks.map(t => t.id === taskId ? { ...t, status: newStatus } : t)
+        tasks: prev.tasks.map(t => (t.id === taskId ? { ...t, ...res.data } : t))
       }));
     } catch (error) {
       console.error("Failed to update status", error);
-      alert("Failed to update task status.");
+      toast.error(errorMessage(error, 'Could not update the task.'));
     }
   };
 
   const handleCreateTask = async () => {
     if (!newTask.projectId || !newTask.name) {
-      alert("Please select a project and enter a task name.");
+      setFormError('Choose a project and give the task a name.');
       return;
     }
+    setFormError('');
     try {
       const res = await api.post('/milestones', newTask);
       setStats(prev => ({
@@ -71,17 +77,81 @@ export default function DeveloperDashboard() {
         tasks: [res.data, ...prev.tasks]
       }));
       setShowTaskModal(false);
-      setNewTask({ projectId: '', name: '', description: '' });
+      setNewTask({ projectId: '', name: '', description: '', dueDate: '', dependencies: [] });
+      toast.success(`Task "${res.data.name}" added.`);
     } catch (error) {
-      alert("Failed to create task: " + (error.response?.data?.error || error.message));
+      setFormError(errorMessage(error, 'Could not create the task.'));
     }
   };
 
-  if (loading) return <div className="p-8 text-slate-500 fade-in">Loading Dev Environment...</div>;
+  if (loading) {
+    return (
+      <div className="max-w-7xl mx-auto space-y-8 fade-in">
+        <LoadingRegion label="Loading your dashboard">
+          <div className="rounded-2xl border border-slate-200 bg-white p-8 lg:p-12">
+            <SkeletonBar width={140} height={24} style={{ marginBottom: 20, borderRadius: 99 }} />
+            <SkeletonBar width="55%" height={36} style={{ marginBottom: 12 }} />
+            <SkeletonBar width="80%" height={14} />
+          </div>
+          <div style={{ marginTop: 24 }}>
+            <SkeletonStats count={4} />
+          </div>
+          <div style={{ marginTop: 24 }} className="rounded-2xl border border-slate-200 bg-white p-6">
+            <SkeletonBar width={180} height={18} style={{ marginBottom: 20 }} />
+            <SkeletonList rows={3} />
+          </div>
+        </LoadingRegion>
+      </div>
+    );
+  }
 
-  const todoTasks = stats.tasks.filter(t => t.status === 'pending');
-  const inProgressTasks = stats.tasks.filter(t => t.status === 'in_progress');
-  const completedTasks = stats.tasks.filter(t => t.status === 'completed');
+
+  const allTasks = stats.tasks || [];
+  const todoTasks = allTasks.filter(t => t.status === 'not_started' || t.status === 'pending');
+  const inProgressTasks = allTasks.filter(t => t.status === 'in_progress');
+  const completedTasks = allTasks.filter(t => t.status === 'completed');
+  const blockedTasks = allTasks.filter(t => t.status === 'blocked');
+
+  const formatDue = (value) =>
+    value ? new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : null;
+
+  // Dependency and deadline context, shown on every card. The dependency graph
+  // was being stored but never surfaced, so nobody could see what blocked what.
+  const TaskMeta = ({ task }) => {
+    const due = formatDue(task.dueDate);
+    const blockers = task.blockedBy || [];
+    if (!due && blockers.length === 0 && !task.owner) return null;
+
+    return (
+      <div className="flex flex-wrap items-center gap-1.5 mb-2">
+        {task.owner && (
+          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+            {task.owner}
+          </span>
+        )}
+        {due && (
+          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex items-center gap-1 ${
+            task.isOverdue ? 'bg-rose-50 text-rose-600' : 'bg-slate-100 text-slate-600'
+          }`}>
+            {task.isOverdue && <AlertTriangle size={9} />} {due}
+          </span>
+        )}
+        {blockers.length > 0 && (
+          <span
+            className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 flex items-center gap-1"
+            title={`Waiting on: ${blockers.map(b => b.name).join(', ')}`}
+          >
+            <Lock size={9} /> Waiting on {blockers.length}
+          </span>
+        )}
+        {(task.dependsOn || []).length > 0 && blockers.length === 0 && (
+          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 flex items-center gap-1">
+            <GitBranch size={9} /> Unblocked
+          </span>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="max-w-7xl mx-auto space-y-8 fade-in">
@@ -104,7 +174,7 @@ export default function DeveloperDashboard() {
             </p>
           </div>
           <button 
-            onClick={handleJoin}
+            onClick={() => setShowJoinModal(true)}
             className="flex items-center gap-2 px-6 py-3 bg-white text-slate-900 rounded-lg font-bold hover:bg-slate-100 transition shadow-lg shadow-white/10 hover-lift"
           >
             <Plus size={18} />
@@ -167,7 +237,7 @@ export default function DeveloperDashboard() {
             {projects.length === 0 && (
               <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-xl bg-slate-50">
                 <p className="text-slate-500 text-xs mb-3">You have not been assigned to any projects yet.</p>
-                <button onClick={handleJoin} className="btn-secondary text-xs py-1.5">Join a Project</button>
+                <button onClick={() => setShowJoinModal(true)} className="btn-secondary text-xs py-1.5">Join a Project</button>
               </div>
             )}
           </div>
@@ -189,6 +259,9 @@ export default function DeveloperDashboard() {
               <span className="px-2 py-1 bg-slate-100 text-slate-600 text-xs font-bold rounded-lg border border-slate-200">To Do ({todoTasks.length})</span>
               <span className="px-2 py-1 bg-blue-50 text-blue-600 text-xs font-bold rounded-lg border border-blue-200">In Progress ({inProgressTasks.length})</span>
               <span className="px-2 py-1 bg-emerald-50 text-emerald-600 text-xs font-bold rounded-lg border border-emerald-200">Done ({completedTasks.length})</span>
+              {blockedTasks.length > 0 && (
+                <span className="px-2 py-1 bg-amber-50 text-amber-700 text-xs font-bold rounded-lg border border-amber-200">Blocked ({blockedTasks.length})</span>
+              )}
             </div>
           </div>
           
@@ -200,9 +273,15 @@ export default function DeveloperDashboard() {
                 {todoTasks.map(t => (
                   <div key={t.id} className="bg-white p-3 rounded-lg shadow-sm border border-slate-200 hover:border-slate-300">
                     <h4 className="font-semibold text-slate-800 text-sm mb-1">{t.name}</h4>
-                    <p className="text-xs text-slate-500 mb-3">{t.description}</p>
-                    <button onClick={() => updateTaskStatus(t.id, 'in_progress')} className="w-full text-xs font-bold bg-blue-50 text-blue-600 py-1.5 rounded hover:bg-blue-100 transition">
-                      Start Task
+                    {t.description && <p className="text-xs text-slate-500 mb-2">{t.description}</p>}
+                    <TaskMeta task={t} />
+                    <button
+                      onClick={() => updateTaskStatus(t.id, 'in_progress')}
+                      disabled={(t.blockedBy || []).length > 0}
+                      title={(t.blockedBy || []).length > 0 ? `Finish ${t.blockedBy.map(b => b.name).join(', ')} first` : undefined}
+                      className="w-full text-xs font-bold bg-blue-50 text-blue-600 py-1.5 rounded hover:bg-blue-100 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      {(t.blockedBy || []).length > 0 ? 'Blocked' : 'Start Task'}
                     </button>
                   </div>
                 ))}
@@ -216,10 +295,16 @@ export default function DeveloperDashboard() {
                 {inProgressTasks.map(t => (
                   <div key={t.id} className="bg-white p-3 rounded-lg shadow-sm border border-blue-200 hover:border-blue-300">
                     <h4 className="font-semibold text-slate-800 text-sm mb-1">{t.name}</h4>
-                    <p className="text-xs text-slate-500 mb-3">{t.description}</p>
-                    <button onClick={() => updateTaskStatus(t.id, 'completed')} className="w-full text-xs font-bold bg-emerald-50 text-emerald-600 py-1.5 rounded hover:bg-emerald-100 transition">
-                      Complete Task
-                    </button>
+                    {t.description && <p className="text-xs text-slate-500 mb-2">{t.description}</p>}
+                    <TaskMeta task={t} />
+                    <div className="flex gap-2">
+                      <button onClick={() => updateTaskStatus(t.id, 'completed')} className="flex-1 text-xs font-bold bg-emerald-50 text-emerald-600 py-1.5 rounded hover:bg-emerald-100 transition">
+                        Complete
+                      </button>
+                      <button onClick={() => updateTaskStatus(t.id, 'blocked')} className="text-xs font-bold bg-amber-50 text-amber-700 py-1.5 px-2 rounded hover:bg-amber-100 transition" title="Mark as blocked">
+                        <Lock size={12} />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -233,7 +318,7 @@ export default function DeveloperDashboard() {
                   <div key={t.id} className="bg-white p-3 rounded-lg shadow-sm border border-emerald-200 opacity-60 hover:opacity-100 transition-opacity">
                     <h4 className="font-semibold text-slate-800 text-sm mb-1 line-through">{t.name}</h4>
                     <p className="text-xs text-slate-500 mb-3">{t.description}</p>
-                    <button onClick={() => updateTaskStatus(t.id, 'pending')} className="w-full text-xs font-bold bg-slate-50 text-slate-600 py-1.5 rounded hover:bg-slate-100 transition">
+                    <button onClick={() => updateTaskStatus(t.id, 'not_started')} className="w-full text-xs font-bold bg-slate-50 text-slate-600 py-1.5 rounded hover:bg-slate-100 transition">
                       Reopen
                     </button>
                   </div>
@@ -242,12 +327,42 @@ export default function DeveloperDashboard() {
             </div>
           </div>
 
+          {blockedTasks.length > 0 && (
+            <div className="mt-4 bg-amber-50/40 rounded-xl p-3 border border-amber-200">
+              <h3 className="text-sm font-bold text-amber-700 mb-3 uppercase tracking-wider flex items-center gap-2">
+                <Lock size={14} /> Blocked
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {blockedTasks.map(t => (
+                  <div key={t.id} className="bg-white p-3 rounded-lg shadow-sm border border-amber-200">
+                    <h4 className="font-semibold text-slate-800 text-sm mb-1">{t.name}</h4>
+                    <TaskMeta task={t} />
+                    <button onClick={() => updateTaskStatus(t.id, 'in_progress')} className="w-full text-xs font-bold bg-blue-50 text-blue-600 py-1.5 rounded hover:bg-blue-100 transition">
+                      Unblock
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
         </div>
       </div>
 
+      <JoinProjectModal
+        isOpen={showJoinModal}
+        onClose={() => setShowJoinModal(false)}
+        onJoined={refreshDashboard}
+      />
+
       {/* Create Task Modal */}
       {showTaskModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 fade-in">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 fade-in"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Create a task"
+          onClick={(e) => { if (e.target === e.currentTarget) setShowTaskModal(false); }}
+        >
           <div className="bg-white rounded-2xl shadow-xl border border-slate-100 w-full max-w-md overflow-hidden relative">
             <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
               <h3 className="font-bold text-slate-900">Create New Sprint Task</h3>
@@ -276,6 +391,7 @@ export default function DeveloperDashboard() {
                   onChange={e => setNewTask(prev => ({ ...prev, name: e.target.value }))}
                   className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
                   placeholder="e.g., Update authentication logic"
+                  aria-label="Task name"
                 />
               </div>
               <div>
@@ -285,7 +401,47 @@ export default function DeveloperDashboard() {
                   onChange={e => setNewTask(prev => ({ ...prev, description: e.target.value }))}
                   className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 min-h-[80px]"
                   placeholder="Additional context for this task..."
+                  aria-label="Task description"
                 />
+              </div>
+
+              {/* A due date is what makes this task count in the schedule
+                  forecast — without one it is flagged as unscheduled work. */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Due date</label>
+                <input
+                  type="date"
+                  value={newTask.dueDate}
+                  onChange={e => setNewTask(prev => ({ ...prev, dueDate: e.target.value }))}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+                <p className="text-xs text-slate-400 mt-1">Used by the schedule forecast to detect slippage.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Depends on</label>
+                <select
+                  multiple
+                  value={newTask.dependencies}
+                  onChange={e => setNewTask(prev => ({
+                    ...prev,
+                    dependencies: Array.from(e.target.selectedOptions, o => o.value),
+                  }))}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 min-h-[80px] text-sm"
+                >
+                  {allTasks
+                    .filter(t => !newTask.projectId || t.projectId === newTask.projectId)
+                    .map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                </select>
+                <p className="text-xs text-slate-400 mt-1">Hold Ctrl or Cmd to pick more than one.</p>
+              </div>
+
+              <div aria-live="polite">
+                {formError && (
+                  <p className="text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+                    {formError}
+                  </p>
+                )}
               </div>
               
               <div className="flex gap-3 pt-2">

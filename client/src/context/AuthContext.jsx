@@ -15,6 +15,8 @@ export const AuthProvider = ({ children }) => {
           const res = await getMe();
           setUser(res.data);
         } catch (err) {
+          // An expired or tampered token: clear it and fall through to signed-out.
+          console.warn('Stored session was rejected:', err?.response?.status || err.message);
           localStorage.removeItem('token');
         }
       }

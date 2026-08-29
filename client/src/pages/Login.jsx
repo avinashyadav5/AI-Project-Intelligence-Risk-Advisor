@@ -6,8 +6,8 @@ import { Shield } from 'lucide-react';
 const Login = () => {
   const { login } = useContext(AuthContext);
   const navigate = useNavigate();
-  const [email, setEmail] = useState('demo@example.com');
-  const [password, setPassword] = useState('password');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -17,7 +17,9 @@ const Login = () => {
     setError(null);
     try {
       await login({ email, password });
-      navigate('/dashboard');
+      const intended = sessionStorage.getItem('redirectAfterLogin');
+      sessionStorage.removeItem('redirectAfterLogin');
+      navigate(intended || '/dashboard');
     } catch (err) {
       setError(err.response?.data?.error || 'Login failed');
     } finally {
@@ -36,7 +38,7 @@ const Login = () => {
           <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-blue-600 flex items-center justify-center shadow-lg shadow-indigo-500/30 mb-4">
             <Shield size={32} className="text-white" />
           </div>
-          <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">Development of AI Powered Health Monitoring & Risk Analysis Platform</h2>
+          <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">AI Project Intelligence & Risk Advisor</h2>
           <p className="text-slate-500 text-sm font-medium mt-1">Sign in to your account</p>
         </div>
 

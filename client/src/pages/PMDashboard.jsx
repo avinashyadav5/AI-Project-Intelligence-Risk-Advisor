@@ -1,12 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Activity, Target, AlertTriangle, ArrowRight, Zap, CheckCircle } from 'lucide-react';
+import { Users, Activity, Target, AlertTriangle, ArrowRight, Zap, CheckCircle, FileText, Sparkles, UserPlus, Trash2, ShieldAlert } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import api from '../services/api';
+import { SkeletonBar, SkeletonStats, SkeletonList, LoadingRegion } from '../components/Skeleton';
+import api, { getProjectActivity } from '../services/api';
 
 export default function PMDashboard() {
   const [projects, setProjects] = useState([]);
   const [stats, setStats] = useState({ activeProjects: 0, avgHealth: 0, criticalRisksCount: 0, teamMembersCount: 0 });
   const [loading, setLoading] = useState(true);
+  const [activity, setActivity] = useState([]);
+  const [activityLoading, setActivityLoading] = useState(true);
   const [inviteModal, setInviteModal] = useState({
     isOpen: false,
     projectId: null,
@@ -27,14 +30,78 @@ export default function PMDashboard() {
         ]);
         setProjects(projectsRes.data);
         setStats(statsRes.data);
+
+        // Merge the activity of the few most recent projects into one feed.
+        const recent = projectsRes.data.slice(0, 5);
+        const feeds = await Promise.all(
+          recent.map(p =>
+            getProjectActivity(p.id, 10)
+              .then(r => r.data.map(entry => ({ ...entry, projectName: p.name })))
+              .catch(() => [])
+          )
+        );
+        setActivity(
+          feeds.flat()
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+            .slice(0, 12)
+        );
       } catch (error) {
         console.error(error);
       } finally {
         setLoading(false);
+        setActivityLoading(false);
       }
     };
     fetchDashboardData();
   }, []);
+
+  const ACTIVITY_META = {
+    'document.uploaded': { icon: FileText, color: '#4f46e5', label: 'uploaded' },
+    'document.analyzed': { icon: Sparkles, color: '#059669', label: 'analysed' },
+    'document.generated': { icon: FileText, color: '#7c3aed', label: 'generated' },
+    'document.deleted': { icon: Trash2, color: '#64748b', label: 'deleted' },
+    'project.created': { icon: Target, color: '#0891b2', label: 'created' },
+    'project.analyzed': { icon: Sparkles, color: '#059669', label: 'analysed' },
+    'risk.critical': { icon: ShieldAlert, color: '#dc2626', label: 'flagged' },
+    'member.invited': { icon: UserPlus, color: '#0891b2', label: 'invited' },
+    'member.joined': { icon: UserPlus, color: '#059669', label: 'joined' },
+    'member.removed': { icon: Users, color: '#64748b', label: 'removed' },
+    'task.created': { icon: CheckCircle, color: '#4f46e5', label: 'added a task' },
+    'task.updated': { icon: CheckCircle, color: '#0891b2', label: 'updated a task' },
+    'task.deleted': { icon: Trash2, color: '#64748b', label: 'removed a task' },
+  };
+
+  const describeActivity = (entry) => {
+    const d = entry.details || {};
+    switch (entry.action) {
+      case 'document.uploaded': return `uploaded ${d.name || 'a document'}`;
+      case 'document.analyzed': return `analysis finished for ${d.name || 'a document'}${d.riskLevel ? ` — ${d.riskLevel} risk` : ''}`;
+      case 'document.generated': return `generated a ${String(d.docType || 'document').replace(/_/g, ' ')}`;
+      case 'document.deleted': return `deleted ${d.name || 'a document'}`;
+      case 'project.created': return `created the project`;
+      case 'project.analyzed': return `ran a project analysis${d.healthScore != null ? ` — health ${d.healthScore}/100` : ''}`;
+      case 'risk.critical': return `critical risk detected${d.riskScore != null ? ` (${d.riskScore}/100)` : ''}`;
+      case 'member.invited': return `invited ${d.email || 'a teammate'} as ${d.role || 'a member'}`;
+      case 'member.joined': return `joined the project`;
+      case 'member.removed': return `removed a member`;
+      case 'task.created': return `added the task "${d.name || 'untitled'}"`;
+      case 'task.updated': return `moved "${d.name || 'a task'}" to ${String(d.status || '').replace(/_/g, ' ')}`;
+      case 'task.deleted': return `removed the task "${d.name || 'untitled'}"`;
+      default: return entry.action.replace(/[._]/g, ' ');
+    }
+  };
+
+  const relativeTime = (value) => {
+    const seconds = Math.floor((Date.now() - new Date(value).getTime()) / 1000);
+    if (seconds < 60) return 'just now';
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    if (days < 7) return `${days}d ago`;
+    return new Date(value).toLocaleDateString();
+  };
 
   const openInviteModal = (projectId) => {
     setInviteModal({
@@ -69,7 +136,27 @@ export default function PMDashboard() {
     }
   };
 
-  if (loading) return <div className="p-8 text-slate-500 fade-in">Loading Dashboard Environments...</div>;
+  if (loading) {
+    return (
+      <div className="max-w-7xl mx-auto space-y-8 fade-in">
+        <LoadingRegion label="Loading your dashboard">
+          <div className="rounded-2xl border border-slate-200 bg-white p-8 lg:p-12">
+            <SkeletonBar width={140} height={24} style={{ marginBottom: 20, borderRadius: 99 }} />
+            <SkeletonBar width="55%" height={36} style={{ marginBottom: 12 }} />
+            <SkeletonBar width="80%" height={14} />
+          </div>
+          <div style={{ marginTop: 24 }}>
+            <SkeletonStats count={4} />
+          </div>
+          <div style={{ marginTop: 24 }} className="rounded-2xl border border-slate-200 bg-white p-6">
+            <SkeletonBar width={180} height={18} style={{ marginBottom: 20 }} />
+            <SkeletonList rows={3} />
+          </div>
+        </LoadingRegion>
+      </div>
+    );
+  }
+
 
   return (
     <div className="max-w-7xl mx-auto space-y-8 fade-in">
@@ -213,43 +300,51 @@ export default function PMDashboard() {
             Live Organization Activity
           </h2>
           
-          <div className="relative pl-6 border-l-2 border-slate-100 space-y-8 mt-4">
-            
-            <div className="relative">
-              <div className="absolute -left-[31px] bg-white p-1 rounded-full border border-slate-100">
-                <div className="w-2.5 h-2.5 bg-indigo-500 rounded-full"></div>
-              </div>
-              <p className="text-sm text-slate-900 font-medium">New document uploaded to <span className="text-indigo-600 font-bold">Q4 Review</span></p>
-              <p className="text-xs text-slate-500 mt-1">Just now • Auto-analysis initiated</p>
-            </div>
+          {activityLoading && (
+            <p className="text-sm text-slate-400">Loading activity...</p>
+          )}
 
-            <div className="relative">
-              <div className="absolute -left-[31px] bg-white p-1 rounded-full border border-slate-100">
-                <div className="w-2.5 h-2.5 bg-emerald-500 rounded-full"></div>
-              </div>
-              <p className="text-sm text-slate-900 font-medium">AI Risk Assessment complete for <span className="font-bold">Project Alpha</span></p>
-              <p className="text-xs text-slate-500 mt-1">2 hours ago • Health Score: 92/100</p>
+          {!activityLoading && activity.length === 0 && (
+            <div className="text-center py-10 border-2 border-dashed border-slate-200 rounded-xl">
+              <Activity size={28} className="mx-auto text-slate-300 mb-2" />
+              <p className="text-slate-500 text-sm">
+                Nothing has happened yet. Upload a document to start the trail.
+              </p>
             </div>
+          )}
 
-            <div className="relative">
-              <div className="absolute -left-[31px] bg-white p-1 rounded-full border border-slate-100">
-                <div className="w-2.5 h-2.5 bg-rose-500 rounded-full"></div>
-              </div>
-              <p className="text-sm text-slate-900 font-medium">Traceability gap detected in <span className="font-bold">Backend API SRS</span></p>
-              <p className="text-xs text-slate-500 mt-1">Yesterday • Assigned to Developer Team</p>
+          {!activityLoading && activity.length > 0 && (
+            <div className="relative pl-6 border-l-2 border-slate-100 space-y-6 mt-4 max-h-[420px] overflow-y-auto pr-2">
+              {activity.map(entry => {
+                const meta = ACTIVITY_META[entry.action] || { color: '#94a3b8' };
+                return (
+                  <div key={entry.id} className="relative">
+                    <div className="absolute -left-[31px] bg-white p-1 rounded-full border border-slate-100">
+                      <div className="w-2.5 h-2.5 rounded-full" style={{ background: meta.color }}></div>
+                    </div>
+                    <p className="text-sm text-slate-900 font-medium">
+                      <span className="font-bold">{entry.user?.name || 'Someone'}</span>{' '}
+                      {describeActivity(entry)}
+                    </p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      {relativeTime(entry.createdAt)} • {entry.projectName}
+                    </p>
+                  </div>
+                );
+              })}
             </div>
-
-          </div>
-          
-          <div className="mt-8 pt-6 border-t border-slate-100">
-            <p className="text-xs text-center text-slate-400 italic">Full live WebSocket integration streaming coming soon.</p>
-          </div>
+          )}
         </div>
       </div>
 
       {/* Invite Modal */}
       {inviteModal.isOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 fade-in">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 fade-in"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Invite a team member"
+          onClick={(e) => { if (e.target === e.currentTarget) setInviteModal(prev => ({ ...prev, isOpen: false })); }}
+        >
           <div className="bg-white rounded-2xl shadow-xl border border-slate-100 w-full max-w-md overflow-hidden relative">
             <div className="px-6 py-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
               <h3 className="font-bold text-slate-900">Invite Team Member</h3>
@@ -267,6 +362,7 @@ export default function PMDashboard() {
                       onChange={e => setInviteModal(prev => ({ ...prev, email: e.target.value }))}
                       className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
                       placeholder="colleague@company.com"
+                      aria-label="Email address to invite"
                     />
                   </div>
                   <div>

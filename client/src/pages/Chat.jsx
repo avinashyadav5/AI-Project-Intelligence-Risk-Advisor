@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MessageSquare, Send, Bot, User, FolderKanban } from 'lucide-react';
-import { getProjects, sendChatMessage } from '../services/api';
+import { getProjects, sendChatMessage, getChatHistory, clearChatHistory } from '../services/api';
 
 const Chat = () => {
   const [messages, setMessages] = useState([]);
@@ -8,30 +8,58 @@ const Chat = () => {
   const [projects, setProjects] = useState([]);
   const [selectedProject, setSelectedProject] = useState(localStorage.getItem('lastSelectedProject') || '');
   const [loading, setLoading] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
     getProjects().then(res => {
       setProjects(res.data);
       const localProject = localStorage.getItem('lastSelectedProject');
-      // Sometimes APIs return .id or ._id, check both
-      const currentExists = res.data.some(p => p.id === selectedProject || p._id === selectedProject);
-      
+      const currentExists = res.data.some(p => p.id === selectedProject);
+
       if (!currentExists && res.data.length > 0) {
-        if (localProject && res.data.some(p => p.id === localProject || p._id === localProject)) {
+        if (localProject && res.data.some(p => p.id === localProject)) {
           setSelectedProject(localProject);
         } else {
-          setSelectedProject(res.data[0]._id || res.data[0].id);
+          setSelectedProject(res.data[0].id);
         }
       }
     }).catch(err => console.error(err));
   }, []);
 
   useEffect(() => {
-    if (selectedProject) {
-      localStorage.setItem('lastSelectedProject', selectedProject);
+    if (!selectedProject) {
+      setMessages([]);
+      return;
     }
+    localStorage.setItem('lastSelectedProject', selectedProject);
+
+    let cancelled = false;
+    setHistoryLoading(true);
+    getChatHistory(selectedProject)
+      .then(res => {
+        if (cancelled) return;
+        setMessages(res.data.map(m => ({
+          role: m.role,
+          content: m.content,
+          sources: Array.isArray(m.sources) ? m.sources : [],
+        })));
+      })
+      .catch(() => { if (!cancelled) setMessages([]); })
+      .finally(() => { if (!cancelled) setHistoryLoading(false); });
+
+    return () => { cancelled = true; };
   }, [selectedProject]);
+
+  const handleClear = async () => {
+    if (!selectedProject) return;
+    try {
+      await clearChatHistory(selectedProject);
+      setMessages([]);
+    } catch (err) {
+      console.error('Could not clear the conversation', err);
+    }
+  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -58,7 +86,10 @@ const Chat = () => {
         sources: res.data.sources
       }]);
     } catch (err) {
-      setMessages(prev => [...prev, { role: 'assistant', content: 'Sorry, I encountered an error while processing your request.' }]);
+      const detail = err?.response?.data?.answer
+        || err?.response?.data?.error
+        || 'I could not reach the assistant. Check that the AI service is running and try again.';
+      setMessages(prev => [...prev, { role: 'assistant', content: detail }]);
     } finally {
       setLoading(false);
     }
@@ -83,15 +114,28 @@ const Chat = () => {
           >
             {projects.length === 0 ? <option value="">No projects available</option> : null}
             {projects.map(p => (
-              <option key={p._id} value={p._id}>{p.name}</option>
+              <option key={p.id} value={p.id}>{p.name}</option>
             ))}
           </select>
+          <button
+            onClick={handleClear}
+            disabled={!selectedProject || messages.length === 0}
+            title="Clear this conversation"
+            style={{
+              padding: '8px 12px', borderRadius: 8, border: '1px solid #cbd5e1',
+              background: '#fff', fontSize: 13, color: '#64748b',
+              cursor: selectedProject && messages.length > 0 ? 'pointer' : 'not-allowed',
+              opacity: selectedProject && messages.length > 0 ? 1 : 0.5,
+            }}
+          >
+            Clear
+          </button>
         </div>
       </div>
 
       {/* Messages */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: 20 }}>
-        {messages.length === 0 && !loading && (
+        {messages.length === 0 && !loading && !historyLoading && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#94a3b8' }}>
             <Bot size={48} style={{ marginBottom: 16, opacity: 0.5 }} />
             <p style={{ fontSize: 16, margin: 0 }}>Ask anything about your project documents...</p>
@@ -111,7 +155,7 @@ const Chat = () => {
                 <div style={{ fontSize: 12, color: '#64748b', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                   <span style={{ fontWeight: 600 }}>Sources:</span>
                   {msg.sources.map((src, i) => (
-                    <span key={i} style={{ background: '#f8fafc', padding: '2px 6px', borderRadius: 4, border: '1px solid #e2e8f0' }}>{src.documentName || src.originalName || 'Document'}</span>
+                    <span key={i} style={{ background: '#f8fafc', padding: '2px 6px', borderRadius: 4, border: '1px solid #e2e8f0' }}>{src.doc_name || src.documentName || src.originalName || 'Document'}</span>
                   ))}
                 </div>
               )}
@@ -141,6 +185,7 @@ const Chat = () => {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="Type your question..."
+            aria-label="Ask a question about this project"
             style={{ flex: 1, border: 'none', outline: 'none', fontSize: 15, color: '#0f172a', background: 'transparent' }}
             disabled={!selectedProject || loading}
           />

@@ -1,9 +1,8 @@
 import React, { useState, useEffect, useRef, useContext } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { AuthContext } from '../context/AuthContext';
-import { getDocument } from '../services/api';
-import { LayoutDashboard, Filter, ArrowLeft, FileText, AlertTriangle, CheckCircle, Lightbulb, Shield, Clock, Download, Target, FileWarning, Search, Users, Activity, CheckSquare, Info, Wand2, X, AlertCircle, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react';
-import html2pdf from 'html2pdf.js';
+import { getDocument, saveReportState, errorMessage } from '../services/api';
+import { LayoutDashboard, ArrowLeft, FileText, AlertTriangle, CheckCircle, Lightbulb, Shield, Clock, Download, Target, FileWarning, Search, Users, Activity, CheckSquare, Info, X, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react';
 
 
 // ── SVG Risk Gauge ─────────────────────────────────────────────────────────────
@@ -111,6 +110,13 @@ const InsightCard = ({ insight, index }) => {
         {copied ? <Check size={16} /> : <Copy size={16} className="hover:text-slate-500 transition-colors" />}
       </button>
       <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-start', paddingRight: 24 }}>
+        {/* The severity icon was computed and then never rendered. */}
+        <Icon
+          size={16}
+          style={{ flexShrink: 0, marginTop: 2 }}
+          color={sev === 'critical' || sev === 'high' ? '#dc2626' : sev === 'medium' ? '#d97706' : '#059669'}
+          aria-hidden="true"
+        />
         <p style={{ margin: 0, fontSize: 14, lineHeight: 1.6, fontWeight: 600 }}>{text}</p>
       </div>
       {evidence && (
@@ -131,6 +137,9 @@ const InsightCard = ({ insight, index }) => {
 const RiskReport = () => {
   const { id } = useParams();
   const { user } = useContext(AuthContext);
+  // Auditors have read-only access, so they should not see controls that
+  // would fail with a 403 on click.
+  const canEditReport = ['pm', 'admin', 'developer'].includes(user?.role);
   const [doc, setDoc] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -140,6 +149,7 @@ const RiskReport = () => {
   const [riskFilter, setRiskFilter] = useState('all');
   const [dismissedBlockers, setDismissedBlockers] = useState(new Set());
   const [completedTasks, setCompletedTasks] = useState(new Set());
+  const [stateError, setStateError] = useState('');
   const [expandedSections, setExpandedSections] = useState({ deliverables: false, userStories: false, traceGaps: false });
   
   const reportRef = useRef();
@@ -148,29 +158,74 @@ const RiskReport = () => {
     setExpandedSections(prev => ({ ...prev, [section]: !prev[section] }));
   };
 
-  const toggleTask = (taskIndex) => {
-    setCompletedTasks(prev => {
-      const next = new Set(prev);
-      if (next.has(taskIndex)) next.delete(taskIndex);
-      else next.add(taskIndex);
-      return next;
-    });
+  const toggleTask = async (taskIndex) => {
+    const previous = completedTasks;
+    const next = new Set(previous);
+    if (next.has(taskIndex)) next.delete(taskIndex);
+    else next.add(taskIndex);
+    setCompletedTasks(next);
+    try {
+      await persistState({ completedActionItems: [...next] });
+    } catch {
+      setCompletedTasks(previous);
+    }
   };
 
-  const dismissBlocker = (blockerIndex) => {
-    setDismissedBlockers(prev => new Set(prev).add(blockerIndex));
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
+
+  /**
+   * Ticking an action item or dismissing a blocker was local React state, so a
+   * refresh silently undid it and no teammate ever saw it. Both are now saved
+   * against the document. The UI updates first and rolls back if the save
+   * fails, so the interaction stays instant.
+   */
+  const persistState = async (next) => {
+    if (!id) return;
+    try {
+      await saveReportState(id, next);
+      setStateError('');
+    } catch (err) {
+      setStateError(errorMessage(err, 'Your change could not be saved.'));
+      throw err;
+    }
   };
 
-  const exportPDF = () => {
+  const dismissBlocker = async (blockerIndex) => {
+    const previous = dismissedBlockers;
+    const next = new Set(previous).add(blockerIndex);
+    setDismissedBlockers(next);
+    try {
+      await persistState({ dismissedBlockers: [...next] });
+    } catch {
+      setDismissedBlockers(previous);
+    }
+  };
+
+  // html2pdf is roughly 900 kB. Loading it on demand keeps it out of the
+  // report page's bundle, so opening a report no longer pays for an export
+  // most people never click.
+  const exportPDF = async () => {
     const element = reportRef.current;
-    const opt = {
-      margin:       0.5,
-      filename:     `RiskReport_${doc?.originalName}.pdf`,
-      image:        { type: 'jpeg', quality: 0.98 },
-      html2canvas:  { scale: 2 },
-      jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
-    };
-    html2pdf().set(opt).from(element).save();
+    if (!element) return;
+
+    setExporting(true);
+    try {
+      const { default: html2pdf } = await import('html2pdf.js');
+      await html2pdf().set({
+        margin: 0.5,
+        filename: `RiskReport_${doc?.originalName || 'report'}.pdf`,
+        image: { type: 'jpeg', quality: 0.98 },
+        html2canvas: { scale: 2 },
+        jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' },
+      }).from(element).save();
+    } catch (err) {
+      console.error('PDF export failed', err);
+      setExportError('The PDF could not be created. Try again.');
+      setTimeout(() => setExportError(''), 6000);
+    } finally {
+      setExporting(false);
+    }
   };
 
   useEffect(() => {
@@ -178,6 +233,13 @@ const RiskReport = () => {
       try {
         const res = await getDocument(id);
         setDoc(res.data);
+        // Restore what the team already ticked off or dismissed.
+        setCompletedTasks(new Set(
+          Array.isArray(res.data.completedActionItems) ? res.data.completedActionItems : []
+        ));
+        setDismissedBlockers(new Set(
+          Array.isArray(res.data.dismissedBlockers) ? res.data.dismissedBlockers : []
+        ));
       } catch (err) {
         setError('Could not load document report. It may still be processing.');
       } finally {
@@ -231,7 +293,37 @@ const RiskReport = () => {
               )}
             </div>
           </div>
+
+          {/* The export handler existed but was never attached to anything,
+              so there was no way to get a PDF out of the report. */}
+          <button
+            onClick={exportPDF}
+            disabled={exporting}
+            data-html2canvas-ignore="true"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 8,
+              padding: '9px 16px', borderRadius: 10, flexShrink: 0,
+              border: '1px solid #e2e8f0', background: '#fff',
+              fontSize: 13, fontWeight: 700, color: '#475569',
+              cursor: exporting ? 'wait' : 'pointer', opacity: exporting ? 0.6 : 1,
+            }}
+          >
+            <Download size={15} />
+            {exporting ? 'Preparing PDF...' : 'Export PDF'}
+          </button>
         </div>
+
+        {stateError && (
+          <p role="alert" style={{ margin: '12px 0 0', fontSize: 13, color: '#b91c1c' }}>
+            {stateError}
+          </p>
+        )}
+
+        {exportError && (
+          <p role="alert" style={{ margin: '12px 0 0', fontSize: 13, color: '#b91c1c' }}>
+            {exportError}
+          </p>
+        )}
       </div>
 
       <div className="grid-cols-1-mobile" style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 24, alignItems: 'start' }}>
@@ -487,7 +579,7 @@ const RiskReport = () => {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                 {doc.blockers.map((blocker, i) => !dismissedBlockers.has(i) && (
                   <div key={i} className={`insight-card-minimal ${blocker.severity || 'high'} p-4`} style={{ animationDelay: `${i * 0.07}s`, position: 'relative' }}>
-                    <button onClick={() => dismissBlocker(i)} style={{ position: 'absolute', top: 8, right: 8, background: 'transparent', border: 'none', cursor: 'pointer', color: '#94a3b8' }} title="Dismiss Blocker">
+                    <button onClick={() => dismissBlocker(i)} disabled={!canEditReport} style={{ position: 'absolute', top: 8, right: 8, background: 'transparent', border: 'none', cursor: 'pointer', color: '#94a3b8' }} title="Dismiss Blocker">
                       <X size={16} className="hover:text-slate-700 transition-colors" />
                     </button>
                     <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: 2, opacity: 0.8 }} />
@@ -506,34 +598,104 @@ const RiskReport = () => {
           )}
 
                     {/* Schedule Forecast */}
-          {activeTab === 'overview' && doc.scheduleForecast && (
-            <div className="glass-panel hover-lift" style={{ padding: 32 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-                <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <Clock size={20} color="#ea580c" /> Schedule Forecast
-                </h3>
-                <span className={`risk-badge ${doc.scheduleForecast.riskLevel || 'medium'}`} style={{ fontSize: 13, padding: '4px 12px' }}>
-                  {doc.scheduleForecast.riskLevel} Risk
-                </span>
+          {activeTab === 'overview' && doc.scheduleForecast && (() => {
+            const sf = doc.scheduleForecast;
+            const level = sf.risk_level || sf.riskLevel || 'Unknown';
+            const factors = sf.delay_factors || sf.delayFactors || [];
+            const recs = sf.recommendations || [];
+            const totals = sf.totals || {};
+            const hasNumbers = sf.status === 'computed';
+
+            return (
+              <div className="glass-panel hover-lift" style={{ padding: 32 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <Clock size={20} color="#ea580c" /> Schedule Forecast
+                  </h3>
+                  <span className={`risk-badge ${String(level).toLowerCase()}`} style={{ fontSize: 13, padding: '4px 12px' }}>
+                    {level} Risk
+                  </span>
+                </div>
+
+                {hasNumbers ? (
+                  <>
+                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 20 }}>
+                      {[
+                        { label: 'Schedule risk', value: sf.schedule_risk_score, suffix: '/100', color: '#ea580c' },
+                        { label: 'Overdue', value: sf.overdue?.length ?? 0, color: '#dc2626' },
+                        { label: 'Blocked', value: sf.blocked_tasks?.length ?? 0, color: '#b91c1c' },
+                        { label: 'Slip (days)', value: sf.projected_slip_days ?? 0, color: '#0f172a' },
+                        { label: 'Tasks', value: totals.total ?? 0, color: '#0f172a' },
+                      ].map(stat => (
+                        <div key={stat.label} style={{ flex: '1 1 110px', padding: 14, borderRadius: 12, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                          <p style={{ margin: 0, fontSize: 22, fontWeight: 800, color: stat.color, lineHeight: 1.1 }}>
+                            {stat.value}{stat.suffix && <span style={{ fontSize: 12, color: '#94a3b8' }}>{stat.suffix}</span>}
+                          </p>
+                          <p style={{ margin: '4px 0 0', fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.4px' }}>{stat.label}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    {sf.projected_completion && (
+                      <p style={{ margin: '0 0 16px', fontSize: 14, color: '#475569' }}>
+                        Planned finish <strong>{sf.baseline_completion}</strong> · projected finish{' '}
+                        <strong style={{ color: '#ea580c' }}>{sf.projected_completion}</strong>
+                      </p>
+                    )}
+
+                    {sf.critical_path?.path?.length > 1 && (
+                      <p style={{ margin: '0 0 16px', fontSize: 14, color: '#475569', lineHeight: 1.6 }}>
+                        <strong>Critical path ({sf.critical_path.length_days}d):</strong>{' '}
+                        {sf.critical_path.path.join(' → ')}
+                      </p>
+                    )}
+
+                    {sf.overdue?.length > 0 && (
+                      <div style={{ marginBottom: 16 }}>
+                        <h4 style={{ margin: '0 0 8px', fontSize: 13, color: '#64748b', textTransform: 'uppercase', fontWeight: 700 }}>Overdue tasks</h4>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {sf.overdue.slice(0, 6).map((t, i) => (
+                            <div key={i} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '8px 12px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, fontSize: 13 }}>
+                              <span style={{ color: '#0f172a', fontWeight: 600 }}>{t.name}</span>
+                              <span style={{ color: '#b91c1c', flexShrink: 0 }}>{t.days_overdue}d overdue · {t.owner}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p style={{ margin: '0 0 16px', fontSize: 14, color: '#64748b', lineHeight: 1.6, padding: 14, background: '#f8fafc', borderRadius: 10, border: '1px solid #e2e8f0' }}>
+                    {sf.reasoning || 'This document has no task or deadline data, so no schedule could be computed. Upload a task list CSV or add milestones with due dates.'}
+                  </p>
+                )}
+
+                {factors.length > 0 && (
+                  <div style={{ marginBottom: 16 }}>
+                    <h4 style={{ margin: '0 0 8px', fontSize: 13, color: '#64748b', textTransform: 'uppercase', fontWeight: 700 }}>Delay Factors</h4>
+                    <ul style={{ margin: 0, padding: '0 0 0 24px', display: 'flex', flexDirection: 'column', gap: 8, fontSize: 15, color: '#475569' }}>
+                      {factors.map((factor, i) => <li key={i}>{factor}</li>)}
+                    </ul>
+                  </div>
+                )}
+
+                {recs.length > 0 && (
+                  <div>
+                    <h4 style={{ margin: '0 0 8px', fontSize: 13, color: '#64748b', textTransform: 'uppercase', fontWeight: 700 }}>Recommendations</h4>
+                    <ul style={{ margin: 0, padding: '0 0 0 24px', display: 'flex', flexDirection: 'column', gap: 8, fontSize: 15, color: '#475569' }}>
+                      {recs.map((rec, i) => <li key={i}>{rec}</li>)}
+                    </ul>
+                  </div>
+                )}
+
+                {hasNumbers && sf.reasoning && (
+                  <p style={{ margin: '16px 0 0', paddingTop: 12, borderTop: '1px solid #f1f5f9', fontSize: 12, color: '#94a3b8', fontStyle: 'italic', lineHeight: 1.6 }}>
+                    {sf.reasoning}
+                  </p>
+                )}
               </div>
-              {doc.scheduleForecast.delayFactors?.length > 0 && (
-                <div style={{ marginBottom: 16 }}>
-                  <h4 style={{ margin: '0 0 8px', fontSize: 13, color: '#64748b', textTransform: 'uppercase', fontWeight: 700 }}>Delay Factors</h4>
-                  <ul style={{ margin: 0, padding: '0 0 0 24px', display: 'flex', flexDirection: 'column', gap: 8, fontSize: 15, color: '#475569' }}>
-                    {doc.scheduleForecast.delayFactors.map((factor, i) => <li key={i}>{factor}</li>)}
-                  </ul>
-                </div>
-              )}
-              {doc.scheduleForecast.recommendations?.length > 0 && (
-                <div>
-                  <h4 style={{ margin: '0 0 8px', fontSize: 13, color: '#64748b', textTransform: 'uppercase', fontWeight: 700 }}>Recommendations</h4>
-                  <ul style={{ margin: 0, padding: '0 0 0 24px', display: 'flex', flexDirection: 'column', gap: 8, fontSize: 15, color: '#475569' }}>
-                    {doc.scheduleForecast.recommendations.map((rec, i) => <li key={i}>{rec}</li>)}
-                  </ul>
-                </div>
-              )}
-            </div>
-          )}
+            );
+          })()}
 
                     {/* User Stories */}
           {activeTab === 'execution' && doc.userStories?.length > 0 && (
@@ -546,16 +708,49 @@ const RiskReport = () => {
               </div>
               {expandedSections.userStories && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                  {doc.userStories.map((story, i) => (
-                    <div key={i} className="hover-lift" style={{ padding: 16, border: '1px solid #e2e8f0', borderRadius: 12, background: '#fff' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
-                        <span style={{ fontSize: 14, color: '#334155', lineHeight: 1.6, flex: 1 }}>
-                          <strong>As a</strong> {story.role}, <strong>I want to</strong> {story.action}, <strong>so that</strong> {story.benefit}
-                        </span>
-                        {story.priority && <span style={{ fontSize: 12, background: '#fef3c7', color: '#b45309', padding: '4px 10px', borderRadius: 99, fontWeight: 700, flexShrink: 0 }}>{story.priority}</span>}
+                  {doc.userStories.map((story, i) => {
+                    // Support both the current agent shape (a written story
+                    // sentence) and the older role/action/benefit fields.
+                    const text = story.story
+                      || (story.role ? `As a ${story.role}, I want to ${story.action}, so that ${story.benefit}` : null);
+                    const criteria = story.acceptance_criteria || story.acceptanceCriteria || [];
+
+                    return (
+                      <div key={story.id || i} className="hover-lift" style={{ padding: 16, border: '1px solid #e2e8f0', borderRadius: 12, background: '#fff' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
+                          <span style={{ flex: 1 }}>
+                            {story.epic && (
+                              <span style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#6366f1', textTransform: 'uppercase', letterSpacing: '0.4px', marginBottom: 4 }}>
+                                {story.epic}
+                              </span>
+                            )}
+                            <span style={{ fontSize: 14, color: '#334155', lineHeight: 1.6 }}>{text}</span>
+                          </span>
+                          <span style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                            {story.id && <span style={{ fontSize: 11, background: '#f1f5f9', color: '#64748b', padding: '4px 8px', borderRadius: 99, fontWeight: 700 }}>{story.id}</span>}
+                            {story.priority && <span style={{ fontSize: 12, background: '#fef3c7', color: '#b45309', padding: '4px 10px', borderRadius: 99, fontWeight: 700 }}>{story.priority}</span>}
+                          </span>
+                        </div>
+
+                        {criteria.length > 0 && (
+                          <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #f1f5f9' }}>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                              Acceptance criteria
+                            </span>
+                            <ul style={{ margin: '6px 0 0', paddingLeft: 20, fontSize: 13, color: '#475569', lineHeight: 1.7 }}>
+                              {criteria.map((c, ci) => <li key={ci}>{c}</li>)}
+                            </ul>
+                          </div>
+                        )}
+
+                        {story.evidence && (
+                          <p style={{ margin: '8px 0 0', fontSize: 12, color: '#94a3b8', fontStyle: 'italic', lineHeight: 1.5 }}>
+                            From: "{story.evidence}"
+                          </p>
+                        )}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -691,7 +886,7 @@ const RiskReport = () => {
                   return (
                   <div key={i} className="hover-lift" style={{ padding: '16px', border: '1px solid', borderColor: isDone ? '#10b981' : '#e2e8f0', borderRadius: '12px', background: isDone ? '#ecfdf5' : '#f8fafc', display: 'flex', justifyContent: 'space-between', alignItems: 'center', transition: 'all 0.2s', opacity: isDone ? 0.7 : 1 }}>
                     <div style={{ flex: 1, display: 'flex', alignItems: 'flex-start', gap: 12 }}>
-                      <button onClick={() => toggleTask(i)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 0, marginTop: 2 }}>
+                      <button onClick={() => toggleTask(i)} disabled={!canEditReport} style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 0, marginTop: 2 }}>
                         {isDone ? <CheckCircle size={20} color="#10b981" /> : <div style={{ width: 18, height: 18, borderRadius: '50%', border: '2px solid #cbd5e1' }} />}
                       </button>
                       <div>

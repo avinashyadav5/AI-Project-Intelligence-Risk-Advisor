@@ -2,11 +2,13 @@ import React, { useState, useEffect } from 'react';
 import { ShieldCheck, FileSearch, History, DownloadCloud, Plus, AlertOctagon, CheckCircle2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
+import JoinProjectModal from '../components/JoinProjectModal';
 
 export default function AuditorDashboard() {
   const [projects, setProjects] = useState([]);
   const [stats, setStats] = useState({ compliantProjects: 0, missingDocsCount: 0, traceabilityGaps: 0 });
   const [loading, setLoading] = useState(true);
+  const [showJoinModal, setShowJoinModal] = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -27,18 +29,16 @@ export default function AuditorDashboard() {
     fetchDashboardData();
   }, []);
 
-  const handleJoin = async () => {
-    const tokenInput = window.prompt("Paste your invite link or token to join a project:");
-    if (!tokenInput) return;
-
-    const token = tokenInput.includes('token=') ? new URL(tokenInput).searchParams.get('token') : tokenInput;
-
+  const refreshDashboard = async () => {
     try {
-      await api.post('/teams/join', { token });
-      alert("Successfully joined the project!");
-      window.location.reload(); // Refresh the list
+      const [projectsRes, statsRes] = await Promise.all([
+        api.get('/projects'),
+        api.get('/dashboard/stats'),
+      ]);
+      setProjects(projectsRes.data);
+      setStats(statsRes.data);
     } catch (error) {
-      alert("Failed to join project: " + (error.response?.data?.error || error.message));
+      console.error(error);
     }
   };
 
@@ -65,7 +65,7 @@ export default function AuditorDashboard() {
           </div>
           <div className="flex gap-3">
             <button 
-              onClick={handleJoin}
+              onClick={() => setShowJoinModal(true)}
               className="px-5 py-2.5 bg-white text-slate-700 border border-slate-200 rounded-lg font-bold hover:bg-slate-50 transition shadow-sm flex items-center gap-2"
             >
               <Plus size={18} /> Join
@@ -155,6 +155,12 @@ export default function AuditorDashboard() {
           </div>
         </div>
       </div>
+      <JoinProjectModal
+        isOpen={showJoinModal}
+        onClose={() => setShowJoinModal(false)}
+        onJoined={refreshDashboard}
+      />
+
     </div>
   );
 }

@@ -4,7 +4,6 @@ import { ShieldAlert, Eye, FolderKanban, BarChart2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 const RiskReports = () => {
-  const [projects, setProjects] = useState([]);
   const [allDocs, setAllDocs] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -13,7 +12,6 @@ const RiskReports = () => {
       try {
         const projRes = await getProjects();
         const projs = projRes.data;
-        setProjects(projs);
         // Fetch docs for all projects in parallel
         const docResults = await Promise.all(projs.map(p => getProjectFiles(p.id)));
         const docs = docResults.flatMap((r, i) =>

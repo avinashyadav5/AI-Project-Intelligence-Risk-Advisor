@@ -1,129 +1,151 @@
 const express = require('express');
 const router = express.Router();
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const prisma = require('../prismaClient');
 const auth = require('../middleware/auth');
 
-// GET /api/dashboard/stats
+/**
+ * Role-aware dashboard aggregates.
+ *
+ * The risk comparisons here used lowercase literals ('critical', 'high') while
+ * the scoring engine writes capitalised bands ('Critical', 'High'), so the PM's
+ * critical-risk counter was permanently zero and every project looked compliant
+ * to the auditor. All comparisons are now normalised.
+ */
+
+const isHighRisk = level => ['critical', 'high'].includes(String(level || '').toLowerCase());
+const isCritical = level => String(level || '').toLowerCase() === 'critical';
+
 router.get('/stats', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const role = req.user.role;
 
+    const membershipFilter = {
+      OR: [{ ownerId: userId }, { members: { some: { userId } } }],
+    };
+
     if (role === 'pm' || role === 'admin') {
-      // 1. Get projects owned by PM or where they are a member
       const projects = await prisma.project.findMany({
-        where: {
-          OR: [
-            { ownerId: userId },
-            { members: { some: { userId: userId } } }
-          ]
-        },
-        include: {
-          documents: true,
-          members: true
-        }
+        where: role === 'admin' ? {} : membershipFilter,
+        include: { documents: true, members: true },
       });
 
-      const activeProjects = projects.length;
-      
-      // Calculate team members (unique members across all projects)
       const uniqueMembers = new Set();
       projects.forEach(p => p.members.forEach(m => uniqueMembers.add(m.userId)));
-      const teamMembersCount = uniqueMembers.size;
 
-      // Calculate Avg Health and Critical Risks
       let totalHealth = 0;
       let healthCount = 0;
       let criticalRisksCount = 0;
+      let analyzedDocuments = 0;
 
       projects.forEach(p => {
         p.documents.forEach(doc => {
-          if (doc.projectHealth && typeof doc.projectHealth === 'object' && doc.projectHealth.score) {
-            totalHealth += doc.projectHealth.score;
+          if (doc.status === 'Analyzed') analyzedDocuments++;
+          const score = doc.projectHealth && typeof doc.projectHealth === 'object'
+            ? doc.projectHealth.score
+            : null;
+          if (typeof score === 'number') {
+            totalHealth += score;
             healthCount++;
           }
-          if (doc.riskLevel === 'critical' || doc.riskLevel === 'high') {
-            criticalRisksCount++;
-          }
+          if (isHighRisk(doc.riskLevel)) criticalRisksCount++;
         });
       });
 
-      const avgHealth = healthCount > 0 ? Math.round(totalHealth / healthCount) : 0;
+      const unreadNotifications = await prisma.notification.count({
+        where: { userId, isRead: false },
+      });
 
       return res.json({
-        activeProjects,
-        avgHealth,
+        activeProjects: projects.length,
+        avgHealth: healthCount > 0 ? Math.round(totalHealth / healthCount) : 0,
         criticalRisksCount,
-        teamMembersCount
+        teamMembersCount: uniqueMembers.size,
+        analyzedDocuments,
+        unreadNotifications,
       });
-    } 
-    else if (role === 'developer') {
-      // Find projects the developer is part of
+    }
+
+    if (role === 'developer') {
       const projects = await prisma.project.findMany({
-        where: { members: { some: { userId: userId } } },
-        select: { id: true }
+        where: { members: { some: { userId } } },
+        select: { id: true },
       });
       const projectIds = projects.map(p => p.id);
 
-      // Find tasks (Milestones) in those projects
       const tasks = await prisma.milestone.findMany({
         where: { projectId: { in: projectIds } },
-        orderBy: { createdAt: 'desc' }
+        orderBy: [{ dueDate: 'asc' }, { createdAt: 'desc' }],
+        include: {
+          project: { select: { id: true, name: true } },
+          dependencies: { include: { dependsOn: { select: { id: true, name: true, status: true } } } },
+        },
       });
 
-      const myTasks = tasks.length;
-      
-      // Calculate deadlines this week
       const now = new Date();
       const nextWeek = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-      const deadlines = tasks.filter(t => t.dueDate && new Date(t.dueDate) > now && new Date(t.dueDate) < nextWeek).length;
+
+      const isDone = t => t.status === 'completed';
+      const deadlines = tasks.filter(
+        t => t.dueDate && !isDone(t) && new Date(t.dueDate) > now && new Date(t.dueDate) < nextWeek
+      ).length;
+      const overdue = tasks.filter(
+        t => t.dueDate && !isDone(t) && new Date(t.dueDate) < now
+      ).length;
+      const blocked = tasks.filter(t => t.status === 'blocked').length;
 
       return res.json({
-        myTasks,
+        myTasks: tasks.filter(t => !isDone(t)).length,
+        totalTasks: tasks.length,
         deadlines,
-        tasks
+        overdue,
+        blocked,
+        completed: tasks.filter(isDone).length,
+        tasks,
       });
     }
-    else if (role === 'auditor') {
+
+    if (role === 'auditor') {
       const projects = await prisma.project.findMany({
-        where: { members: { some: { userId: userId } } },
-        include: { documents: true }
+        where: membershipFilter,
+        include: { documents: true },
       });
 
       let compliantProjects = 0;
       let missingDocsCount = 0;
       let traceabilityGaps = 0;
+      let criticalFindings = 0;
 
       projects.forEach(p => {
-        let isCompliant = true;
+        let isCompliant = p.documents.length > 0;
         p.documents.forEach(doc => {
-          if (doc.riskLevel === 'critical') isCompliant = false;
-          
-          if (doc.missingDocs && Array.isArray(doc.missingDocs)) {
-            missingDocsCount += doc.missingDocs.length;
+          if (isCritical(doc.riskLevel)) {
+            isCompliant = false;
+            criticalFindings++;
           }
-          
-          if (doc.traceability && Array.isArray(doc.traceability)) {
-            // Very simplified trace gap count
-            traceabilityGaps += doc.traceability.filter(t => !t.satisfied).length;
+          if (Array.isArray(doc.missingDocs)) missingDocsCount += doc.missingDocs.length;
+          if (Array.isArray(doc.traceability)) {
+            // A gap object records satisfied:false. Treat a missing flag as an
+            // open gap, but never count an explicitly satisfied one.
+            traceabilityGaps += doc.traceability.filter(t => t && t.satisfied !== true).length;
           }
         });
-        if (isCompliant && p.documents.length > 0) compliantProjects++;
+        if (isCompliant) compliantProjects++;
       });
 
       return res.json({
+        totalProjects: projects.length,
         compliantProjects,
         missingDocsCount,
-        traceabilityGaps
+        traceabilityGaps,
+        criticalFindings,
       });
     }
 
-    return res.status(400).json({ error: "Invalid role" });
-
+    return res.status(400).json({ error: 'Unknown role.' });
   } catch (error) {
-    console.error("Dashboard Stats Error:", error);
-    res.status(500).json({ error: "Failed to load dashboard stats" });
+    console.error('Dashboard stats error:', error);
+    res.status(500).json({ error: 'Failed to load dashboard stats.' });
   }
 });
 

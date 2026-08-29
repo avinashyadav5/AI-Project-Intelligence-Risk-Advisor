@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Database
   postgres:
@@ -20,7 +18,7 @@ services:
     networks:
       - app_network
 
-  # Python AI Service
+  # Python AI microservice
   ai-service:
     build:
       context: ./ai-service
@@ -29,11 +27,27 @@ services:
       - "8000:8000"
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+      - RUN_ALL_AGENTS=${RUN_ALL_AGENTS:-}
+    volumes:
+      # The FAISS indexes are the project knowledge base. Without a volume they
+      # were wiped on every container restart, which defeated the whole point
+      # of persistent project memory.
+      - kb_data:/app/knowledge_base
+      - ai_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      # The embedding model downloads on first boot, so allow time before
+      # marking the service unhealthy.
+      start_period: 180s
     networks:
       - app_network
     restart: unless-stopped
 
-  # Node Express Server
+  # Node Express API
   server:
     build:
       context: ./server
@@ -43,12 +57,14 @@ services:
     environment:
       - PORT=5000
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/${DB_NAME:-riskadvisor}?schema=public
-      - JWT_SECRET=${JWT_SECRET:-your_super_secret_jwt_key}
-      - GROQ_API_KEY=${GROQ_API_KEY}
+      - JWT_SECRET=${JWT_SECRET:?Set JWT_SECRET in your .env before starting}
       - AI_SERVICE_URL=http://ai-service:8000
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-sk_test_12345}
-      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-whsec_12345}
-      - CLIENT_URL=http://localhost:5173
+      - CLIENT_URL=${CLIENT_URL:-http://localhost:5173}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:5173}
+    volumes:
+      # Uploaded files must outlive the container, or every restart orphans
+      # every document row.
+      - server_uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,15 +74,17 @@ services:
       - app_network
     restart: unless-stopped
 
-  # React Client
+  # React client
   client:
     build:
       context: ./client
       dockerfile: Dockerfile
+      args:
+        # Vite inlines env vars at BUILD time. This was previously passed as a
+        # runtime environment variable, where it had no effect at all.
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:5000/api}
     ports:
       - "5173:80"
-    environment:
-      - VITE_API_URL=http://localhost:5000/api
     depends_on:
       - server
     networks:
@@ -75,6 +93,9 @@ services:
 
 volumes:
   postgres_data:
+  kb_data:
+  ai_uploads:
+  server_uploads:
 
 networks:
   app_network:

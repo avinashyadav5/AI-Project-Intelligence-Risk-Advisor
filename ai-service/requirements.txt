@@ -1,11 +1,20 @@
-fastapi
-uvicorn
-python-multipart
-requests
-PyMuPDF
-python-docx
-groq
-python-dotenv
-faiss-cpu
-sentence-transformers
-numpy
+# Pinned so an examiner or teammate gets the same environment.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+
+# HTTP client used for every Groq call. This was imported by main.py but was
+# missing from this file — it only worked because another package pulled it in.
+httpx==0.28.1
+
+# Document extraction
+PyMuPDF==1.25.1
+python-docx==1.1.2
+
+# RAG: local embeddings + vector index
+faiss-cpu==1.9.0.post1
+sentence-transformers==3.3.1
+numpy==2.2.1
+
+python-dotenv==1.0.1
