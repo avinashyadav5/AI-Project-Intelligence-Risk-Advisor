@@ -1,0 +1,40 @@
+services:
+  # ── Express + Socket.io API ──────────────────────────────────────────────────
+  - type: web
+    name: ai-risk-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm ci && npx prisma generate
+    startCommand: npx prisma db push --accept-data-loss && npm start
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: DATABASE_URL
+        sync: false          # set in Render dashboard
+      - key: JWT_SECRET
+        sync: false          # set in Render dashboard
+      - key: GROQ_API_KEY
+        sync: false          # set in Render dashboard
+      - key: AI_SERVICE_URL
+        sync: false          # set after ai-service is deployed
+      - key: CLIENT_URL
+        sync: false          # set after Vercel deploy
+      - key: ALLOWED_ORIGINS
+        sync: false          # same as CLIENT_URL
+
+  # ── FastAPI AI Microservice ──────────────────────────────────────────────────
+  - type: web
+    name: ai-risk-aiservice
+    runtime: python
+    rootDir: ai-service
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
+    plan: free
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # set in Render dashboard
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
