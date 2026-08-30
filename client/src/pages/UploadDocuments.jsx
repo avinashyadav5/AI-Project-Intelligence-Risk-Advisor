@@ -123,7 +123,16 @@ const UploadDocuments = () => {
       setDocuments(prev => prev.map(d => (d.id === doc.id ? { ...d, status: 'Processing', errorMessage: null } : d)));
       toast.info('Re-analysing ' + doc.originalName + '.');
     } catch (err) {
-      setRowError(errorMessage(err, 'Could not restart the analysis.'));
+      const msg = errorMessage(err, 'Could not restart the analysis.');
+      // Free-tier Render wipes /uploads on restart — give a clear, actionable message
+      const isFileMissing = msg.toLowerCase().includes('no longer on the server') ||
+                            msg.toLowerCase().includes('file not found') ||
+                            err?.response?.status === 404;
+      setRowError(
+        isFileMissing
+          ? `"${doc.originalName}" was deleted when the server restarted (free tier limitation). Please re-upload the file to analyse it again.`
+          : msg
+      );
     } finally {
       setRowBusy(null);
     }
@@ -373,8 +382,12 @@ const UploadDocuments = () => {
           </div>
 
           {rowError && (
-            <div className="px-6 py-3 bg-rose-50 border-b border-rose-100 text-sm text-rose-700">
-              {rowError}
+            <div className="px-6 py-3 bg-rose-50 border-b border-rose-200 flex items-start gap-3">
+              <AlertCircle size={16} className="text-rose-500 shrink-0 mt-0.5" />
+              <p className="text-sm text-rose-700 flex-1">{rowError}</p>
+              <button onClick={() => setRowError('')} className="text-rose-400 hover:text-rose-600 shrink-0">
+                <X size={14} />
+              </button>
             </div>
           )}
 
