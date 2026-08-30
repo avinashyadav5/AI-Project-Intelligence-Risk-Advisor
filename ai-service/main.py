@@ -117,6 +117,21 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list:
     return chunks
 
 
+def embed_in_batches(texts: list, batch_size: int = 32) -> np.ndarray:
+    """
+    Process embeddings in small chunks to prevent huge memory spikes 
+    that lead to OOM kills on memory-constrained environments like Render.
+    """
+    if not texts or not embed_model:
+        return np.array([]).astype('float32')
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch_emb = list(embed_model.embed(batch))
+        all_embeddings.extend(batch_emb)
+    return np.array(all_embeddings).astype('float32')
+
+
 _retrieve_cache = {}
 
 def retrieve_context(text: str, k: int = 8) -> tuple:
@@ -142,7 +157,7 @@ def retrieve_context(text: str, k: int = 8) -> tuple:
         if not chunks:
             return text[:12000], 0.0
 
-        embeddings = np.array(list(embed_model.embed(chunks))).astype('float32')
+        embeddings = embed_in_batches(chunks, batch_size=32)
         index = faiss.IndexFlatL2(embeddings.shape[1])
         index.add(embeddings)
         
@@ -198,7 +213,7 @@ def _rebuild_index(project_id: str, chunks_meta: list):
             json.dump([], f)
         return
 
-    embeddings = np.array(list(embed_model.embed([c["text"] for c in chunks_meta]))).astype('float32')
+    embeddings = embed_in_batches([c["text"] for c in chunks_meta], batch_size=32)
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
     faiss.write_index(index, str(index_path))
@@ -234,7 +249,7 @@ def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str
         _rebuild_index(project_id, kept + new_meta)
         return
 
-    embeddings = np.array(list(embed_model.embed(chunks))).astype('float32')
+    embeddings = embed_in_batches(chunks, batch_size=32)
 
     if index_path.exists():
         index = faiss.read_index(str(index_path))
