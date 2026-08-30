@@ -1027,8 +1027,12 @@ async def analyze_file(
     analysis_text = extracted_text
     if tasks:
         analysis_text = csv_tasks.tasks_to_text(parsed_tasks) + "\n\n" + extracted_text
+        
+    # Render's proxy has a strict 100s timeout. Large PDFs running through 5 agents
+    # can exceed this. Truncate the text sent to the LLM to stay within the limit.
+    safe_analysis_text = analysis_text[:30000] if analysis_text else ""
 
-    result = run_agent_pipeline(analysis_text, tasks=tasks)
+    result = run_agent_pipeline(safe_analysis_text, tasks=tasks)
     analysis_source = result.pop("analysis_source", "groq_pipeline" if HAS_GROQ else "keyword_fallback")
 
     # Store in the project knowledge base under the real document id, so chat
@@ -1099,8 +1103,12 @@ def analyze_project(req: ProjectAnalyzeRequest):
             "depends_on": m.get("depends_on") or m.get("dependsOn") or [],
             "effort": m.get("effort"),
         })
+        })
 
-    result = run_agent_pipeline(context_text, tasks=tasks, force_all_agents=True)
+    # Render proxy timeout safeguard
+    safe_context_text = context_text[:40000] if context_text else ""
+
+    result = run_agent_pipeline(safe_context_text, tasks=tasks, force_all_agents=True)
     analysis_source = result.pop("analysis_source", "groq_pipeline")
 
     result.update({
