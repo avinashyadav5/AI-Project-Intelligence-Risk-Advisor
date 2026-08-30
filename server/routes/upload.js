@@ -253,37 +253,4 @@ router.get(
   }
 );
 
-// ── POST /api/upload/:id/reanalyze ───────────────────────────────────────────
-router.post(
-  '/:id/reanalyze',
-  auth,
-  requireProjectAccess(async (req) => {
-    const doc = await prisma.document.findUnique({
-      where: { id: req.params.id },
-      select: { projectId: true },
-    });
-    return doc?.projectId;
-  }),
-  requireRole('pm', 'developer'),
-  async (req, res) => {
-    try {
-      const doc = await prisma.document.findUnique({ where: { id: req.params.id } });
-      if (!doc) return res.status(404).json({ error: 'Document not found.' });
-
-      const filePath = path.join(__dirname, '../uploads', doc.filename);
-      if (!fs.existsSync(filePath)) {
-        return res.status(410).json({ error: 'The original file is no longer on the server.' });
-      }
-
-      res.json({ message: 'Re-analysis started.', documentId: doc.id });
-      setImmediate(() =>
-        triggerAnalysis(doc.id, filePath, doc.originalName, doc.projectId, req.user.id)
-      );
-    } catch (err) {
-      console.error('Re-analysis error:', err);
-      if (!res.headersSent) res.status(500).json({ error: 'Failed to start re-analysis.' });
-    }
-  }
-);
-
 module.exports = router;

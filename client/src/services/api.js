@@ -74,7 +74,6 @@ export const uploadFile = (formData) => api.post('/upload', formData, {
   timeout: 120000,
 });
 export const getProjectFiles = (projectId) => api.get(`/upload/project/${projectId}`);
-export const reanalyzeDocument = (documentId) => api.post(`/upload/${documentId}/reanalyze`);
 export const getDocument = (id) => api.get(`/documents/${id}`);
 export const deleteDocument = (id) => api.delete(`/documents/${id}`);
 export const saveReportState = (id, state) => api.patch(`/documents/${id}/report-state`, state);

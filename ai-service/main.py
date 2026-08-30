@@ -21,6 +21,14 @@ import os, re, io, uuid, time, json, shutil
 from pathlib import Path
 from typing import Optional, List
 
+# ── Prevent CPU starvation on Render free tier ───────────────────────────────
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import scoring
 import csv_tasks
 import schedule as schedule_engine
@@ -87,7 +95,8 @@ embed_model = None
 if HAS_RAG:
     try:
         print("Loading local embedding model (all-MiniLM-L6-v2) via fastembed...")
-        embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        # Force single-threaded execution to prevent CPU lockups on Render free tier
+        embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2", threads=1)
         print("Embedding model loaded successfully.")
     except Exception as e:
         print(f"Failed to load embedding model: {e}")
@@ -137,8 +146,8 @@ def retrieve_context(text: str, k: int = 8) -> tuple:
         index = faiss.IndexFlatL2(embeddings.shape[1])
         index.add(embeddings)
         
-        # Keep cache small (prevent memory leaks over time)
-        if len(_retrieve_cache) > 10:
+        # Keep cache extremely small to prevent OOM on 512MB Render instances
+        if len(_retrieve_cache) >= 2:
             _retrieve_cache.clear()
         _retrieve_cache[cache_key] = (chunks, index)
 
