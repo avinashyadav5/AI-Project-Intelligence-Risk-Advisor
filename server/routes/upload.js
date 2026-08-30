@@ -72,12 +72,27 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
     // replaces the old chunks instead of duplicating them.
     form.append('documentId', docId);
 
-    const aiResponse = await ai.post('/analyze', form, {
+    const initResponse = await ai.post('/analyze', form, {
       headers: form.getHeaders(),
-      timeout: 300000, // Groq 429 backoffs can take several minutes
+      timeout: 60000, 
     });
 
-    const data = aiResponse.data;
+    const taskId = initResponse.data.task_id;
+    if (!taskId) throw new Error("Failed to start AI analysis (no task_id)");
+
+    let data = null;
+    for (let i = 0; i < 60; i++) { // wait up to 5 minutes
+      await new Promise(r => setTimeout(r, 5000));
+      const statusRes = await ai.get(`/task/${taskId}`);
+      if (statusRes.data.status === 'completed') {
+        data = statusRes.data.result;
+        break;
+      } else if (statusRes.data.status === 'failed') {
+        throw new Error(statusRes.data.error || 'AI processing failed internally');
+      }
+    }
+
+    if (!data) throw new Error("Analysis timed out after 5 minutes.");
 
     await prisma.document.update({
       where: { id: docId },

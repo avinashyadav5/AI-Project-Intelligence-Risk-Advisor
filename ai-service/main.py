@@ -1011,16 +1011,63 @@ async def process_file(file: UploadFile = File(...), projectId: Optional[str] = 
         shutil.copyfileobj(file.file, buf)
     return {"status": "success", "file_id": file_id, "filename": file.filename, "projectId": projectId}
 
+from fastapi import BackgroundTasks
+
+# Store task results in memory
+_tasks_db = {}
+
+def process_document_pipeline(task_id, file_bytes, ext, filename, projectId, documentId):
+    start = time.time()
+    try:
+        extracted_text = extract_text(file_bytes, ext)
+        word_count = len(re.findall(r'\b\w+\b', extracted_text)) if extracted_text else 0
+
+        parsed_tasks = csv_tasks.parse_tasks(extracted_text)
+        tasks = parsed_tasks.get("tasks", [])
+        analysis_text = extracted_text
+        if tasks:
+            analysis_text = csv_tasks.tasks_to_text(parsed_tasks) + "\n\n" + extracted_text
+            
+        safe_analysis_text = analysis_text[:30000] if analysis_text else ""
+
+        result = run_agent_pipeline(safe_analysis_text, tasks=tasks)
+        analysis_source = result.pop("analysis_source", "groq_pipeline" if HAS_GROQ else "keyword_fallback")
+
+        if projectId:
+            add_to_knowledge_base(
+                projectId,
+                extracted_text,
+                documentId or str(uuid.uuid4()),
+                filename,
+            )
+
+        processing_time_ms = round((time.time() - start) * 1000, 2)
+
+        response = {
+            "status": "success",
+            "filename": filename,
+            "projectId": projectId,
+            "documentId": documentId,
+            "word_count": word_count,
+            "processing_time_ms": processing_time_ms,
+            "analysis_source": analysis_source,
+            "extracted_text": extracted_text[:5000],
+            "task_parse_status": parsed_tasks.get("parse_status"),
+        }
+        response.update(result)
+        _tasks_db[task_id] = {"status": "completed", "result": response}
+    except Exception as e:
+        print(f"Background task failed for {filename}: {e}")
+        _tasks_db[task_id] = {"status": "failed", "error": str(e)}
 
 @app.post("/analyze")
 async def analyze_file(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     projectId: Optional[str] = Form(None),
     documentId: Optional[str] = Form(None),
 ):
-    """Core AI analysis endpoint — multi-agent pipeline over a single document."""
-    start = time.time()
-
+    """Core AI analysis endpoint — now uses background tasks to avoid Render proxy 100s timeouts."""
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -1029,50 +1076,24 @@ async def analyze_file(
         )
 
     file_bytes = await file.read()
-    extracted_text = extract_text(file_bytes, ext)
-    word_count = len(re.findall(r'\b\w+\b', extracted_text)) if extracted_text else 0
+    task_id = str(uuid.uuid4())
+    _tasks_db[task_id] = {"status": "processing"}
+    
+    # Run heavy pipeline in background
+    background_tasks.add_task(
+        process_document_pipeline,
+        task_id, file_bytes, ext, file.filename, projectId, documentId
+    )
+    
+    return {"status": "processing", "task_id": task_id}
 
-    # Task lists become structured rows, and the clean rendering is what the
-    # agents read — a CSV is no longer treated as prose.
-    parsed_tasks = csv_tasks.parse_tasks(extracted_text)
-    tasks = parsed_tasks.get("tasks", [])
-    analysis_text = extracted_text
-    if tasks:
-        analysis_text = csv_tasks.tasks_to_text(parsed_tasks) + "\n\n" + extracted_text
-        
-    # Render's proxy has a strict 100s timeout. Large PDFs running through 5 agents
-    # can exceed this. Truncate the text sent to the LLM to stay within the limit.
-    safe_analysis_text = analysis_text[:30000] if analysis_text else ""
-
-    result = run_agent_pipeline(safe_analysis_text, tasks=tasks)
-    analysis_source = result.pop("analysis_source", "groq_pipeline" if HAS_GROQ else "keyword_fallback")
-
-    # Store in the project knowledge base under the real document id, so chat
-    # answers can cite the filename this text came from.
-    if projectId:
-        add_to_knowledge_base(
-            projectId,
-            extracted_text,
-            documentId or str(uuid.uuid4()),
-            file.filename,
-        )
-
-    processing_time_ms = round((time.time() - start) * 1000, 2)
-
-    response = {
-        "status": "success",
-        "filename": file.filename,
-        "projectId": projectId,
-        "documentId": documentId,
-        "word_count": word_count,
-        "processing_time_ms": processing_time_ms,
-        "analysis_source": analysis_source,
-        "extracted_text": extracted_text[:5000],
-        "task_parse_status": parsed_tasks.get("parse_status"),
-    }
-    response.update(result)
-    return response
-
+@app.get("/task/{task_id}")
+def get_task_status(task_id: str):
+    """Check the status of a background analysis task."""
+    task = _tasks_db.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
 
 class ProjectAnalyzeRequest(BaseModel):
     project_id: str
