@@ -213,7 +213,7 @@ const UploadDocuments = () => {
 
       <div className="grid grid-cols-1 lg:grid-cols-[400px_1fr] gap-8 items-start">
         {/* ── Left Sidebar (Upload & Chat) ── */}
-        <div className="flex flex-col gap-6 sticky top-6">
+        <div className="flex flex-col gap-6">
           {/* ── Upload Panel ── */}
           <div className="glass-panel p-6 rounded-2xl border border-slate-200">
           <h3 className="text-lg font-bold text-slate-900 mb-6">Upload New Document</h3>
@@ -346,8 +346,9 @@ const UploadDocuments = () => {
             </div>
           </>
         )}
+      </div>
 
-        {/* ── Documents Table ── */}
+      {/* ── Documents Table ── */}
         <div className="glass-panel rounded-2xl border border-slate-200 overflow-hidden">
           <div className="p-6 border-b border-slate-100 bg-white flex justify-between items-center">
             <div>
@@ -487,7 +488,6 @@ const UploadDocuments = () => {
             </div>
           )}
         </div>
-      </div>
 
       {confirmDeleteDoc && (
         <div style={{

@@ -67,6 +67,8 @@ const RiskAlerts = ({ projectId }) => {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12, maxHeight: 260, overflowY: 'auto' }}>
           {alerts.map(alert => {
             const tone = levelTone(alert.riskLevel);
+            const d = new Date(alert.createdAt);
+            const timeStr = d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) + ' · ' + d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
             return (
               <Link
                 key={alert.id}
@@ -77,13 +79,20 @@ const RiskAlerts = ({ projectId }) => {
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'flex-start' }}>
-                  <span style={{ fontSize: 13, color: '#0f172a', lineHeight: 1.5, flex: 1 }}>
-                    {alert.message}
-                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {alert.riskLevel && (
+                      <span style={{ display: 'inline-block', fontSize: 10, fontWeight: 700, color: tone.fg, background: tone.border, padding: '1px 6px', borderRadius: 99, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                        {alert.riskLevel}
+                      </span>
+                    )}
+                    <p style={{ fontSize: 13, color: '#0f172a', lineHeight: 1.5, margin: 0, wordBreak: 'break-word', overflowWrap: 'break-word' }}>
+                      {alert.message}
+                    </p>
+                  </div>
                   <ArrowRight size={14} color={tone.fg} style={{ flexShrink: 0, marginTop: 2 }} />
                 </div>
-                <span style={{ display: 'block', fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
-                  {new Date(alert.createdAt).toLocaleString()} · score {alert.riskScore}/100
+                <span style={{ display: 'block', fontSize: 11, color: '#94a3b8', marginTop: 6 }}>
+                  {timeStr} · score {alert.riskScore}/100
                 </span>
               </Link>
             );
