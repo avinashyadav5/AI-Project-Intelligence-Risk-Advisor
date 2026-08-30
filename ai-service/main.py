@@ -108,12 +108,14 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list:
     return chunks
 
 
+_retrieve_cache = {}
+
 def retrieve_context(text: str, k: int = 8) -> tuple:
     """
     Chunk, embed and retrieve the top-K most risk-relevant passages.
-
-    Always returns (context_text, avg_distance) — callers unpack a 2-tuple, so
-    every branch must return one.
+    
+    Memoized to avoid re-embedding the entire document 5 times for the 5 agents
+    since the risk query is currently identical for all of them.
     """
     if not HAS_RAG or not embed_model:
         return text[:12000], 0.0
@@ -121,14 +123,24 @@ def retrieve_context(text: str, k: int = 8) -> tuple:
     if len(text) < 12000:
         return text, 0.0
 
-    chunks = chunk_text(text, chunk_size=300, overlap=50)
-    if not chunks:
-        return text[:12000], 0.0
+    cache_key = hash(text)
+    if cache_key in _retrieve_cache:
+        cached_chunks, cached_index = _retrieve_cache[cache_key]
+        chunks = cached_chunks
+        index = cached_index
+    else:
+        chunks = chunk_text(text, chunk_size=300, overlap=50)
+        if not chunks:
+            return text[:12000], 0.0
 
-    embeddings = np.array(list(embed_model.embed(chunks))).astype('float32')
-
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
+        embeddings = np.array(list(embed_model.embed(chunks))).astype('float32')
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+        
+        # Keep cache small (prevent memory leaks over time)
+        if len(_retrieve_cache) > 10:
+            _retrieve_cache.clear()
+        _retrieve_cache[cache_key] = (chunks, index)
 
     query = ("Identify financial risks, operational delays, technical vulnerabilities, "
              "legal liabilities, compliance issues, and critical roadblocks.")
@@ -506,7 +518,7 @@ def analyze_with_groq(text: str) -> Optional[dict]:
         # No API key: don't embed, don't retry, just let the caller fall back.
         return None
 
-    retrieved_text, avg_distance = retrieve_context(text, k=10)
+    retrieved_text, avg_distance = retrieve_context(text, k=6)
     prompt = ANALYSIS_PROMPT.format(text=retrieved_text)
     system_msg = "You are a precise JSON-only risk analysis engine. Always respond with valid JSON and nothing else."
 
@@ -576,7 +588,7 @@ Rules:
 def agent_scope_planning(text: str) -> Optional[dict]:
     if not HAS_GROQ:
         return None
-    retrieved_text, _ = retrieve_context(text, k=8)
+    retrieved_text, _ = retrieve_context(text, k=4)
     prompt = SCOPE_PROMPT.format(text=retrieved_text)
     system_msg = "You are a precise JSON-only scope and planning engine. Return ONLY valid JSON."
     return call_groq(system_msg, prompt)
@@ -609,7 +621,7 @@ Rules:
 def agent_health(text: str) -> Optional[dict]:
     if not HAS_GROQ:
         return None
-    retrieved_text, _ = retrieve_context(text, k=6)
+    retrieved_text, _ = retrieve_context(text, k=3)
     prompt = HEALTH_PROMPT.format(text=retrieved_text)
     system_msg = "You are a precise JSON-only health scoring engine. Return ONLY valid JSON."
 
@@ -668,7 +680,7 @@ Rules:
 def agent_traceability(text: str) -> Optional[dict]:
     if not HAS_GROQ:
         return None
-    retrieved_text, _ = retrieve_context(text, k=6)
+    retrieved_text, _ = retrieve_context(text, k=3)
     prompt = TRACE_PROMPT.format(text=retrieved_text)
     system_msg = "You are an audit agent. Return ONLY valid JSON."
     return call_groq(system_msg, prompt)
@@ -695,7 +707,7 @@ Return ONLY valid JSON matching this structure exactly. If this is not a meeting
 def agent_meeting(text: str) -> Optional[dict]:
     if not HAS_GROQ:
         return None
-    retrieved_text, _ = retrieve_context(text, k=6)
+    retrieved_text, _ = retrieve_context(text, k=3)
     prompt = MEETING_PROMPT.format(text=retrieved_text)
     system_msg = "You are a meeting analysis agent. Return ONLY valid JSON."
     return call_groq(system_msg, prompt)
@@ -734,7 +746,7 @@ Rules:
 def agent_user_stories(text: str) -> Optional[dict]:
     if not HAS_GROQ:
         return None
-    retrieved_text, _ = retrieve_context(text, k=8)
+    retrieved_text, _ = retrieve_context(text, k=4)
     prompt = STORY_PROMPT.format(text=retrieved_text)
     system_msg = "You are an agile analyst. Return ONLY valid JSON."
     return call_groq(system_msg, prompt, max_tokens=3000)
