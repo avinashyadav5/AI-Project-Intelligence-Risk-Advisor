@@ -334,7 +334,7 @@ const UploadDocuments = () => {
 
         {/* ── Project-level intelligence, trend and team ── */}
         {selectedProject && (
-          <>
+          <div className="flex flex-col gap-6 min-w-0">
             <ProjectIntelligence projectId={selectedProject} />
             <TaskBoard projectId={selectedProject} />
             <div className="intel-grid">
@@ -344,7 +344,7 @@ const UploadDocuments = () => {
                 <RiskAlerts projectId={selectedProject} />
               </div>
             </div>
-          </>
+          </div>
         )}
       </div>
 
