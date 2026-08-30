@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { getProjects, uploadFile, getProjectFiles, getDocument, reanalyzeDocument, deleteDocument, errorMessage, API_BASE_URL } from '../services/api';
+import { getProjects, uploadFile, getProjectFiles, getDocument, deleteDocument, errorMessage, API_BASE_URL } from '../services/api';
 import DocumentGeneratorModal from '../components/DocumentGeneratorModal';
-import { UploadCloud, FileText, CheckCircle, AlertCircle, RefreshCw, Eye, X, Wand2, Trash2, RotateCw } from 'lucide-react';
+import { UploadCloud, FileText, CheckCircle, AlertCircle, RefreshCw, Eye, X, Wand2, Trash2 } from 'lucide-react';
 import ProjectChat from '../components/ProjectChat';
 import ProjectIntelligence from '../components/ProjectIntelligence';
 import HealthTrend from '../components/HealthTrend';
@@ -114,29 +114,6 @@ const UploadDocuments = () => {
   const [rowError, setRowError] = useState('');
   const [confirmDeleteDoc, setConfirmDeleteDoc] = useState(null);
 
-  // Recovers a document whose analysis failed or was interrupted by a restart.
-  const handleReanalyze = async (doc) => {
-    setRowBusy(doc.id);
-    setRowError('');
-    try {
-      await reanalyzeDocument(doc.id);
-      setDocuments(prev => prev.map(d => (d.id === doc.id ? { ...d, status: 'Processing', errorMessage: null } : d)));
-      toast.info('Re-analysing ' + doc.originalName + '.');
-    } catch (err) {
-      const msg = errorMessage(err, 'Could not restart the analysis.');
-      // Free-tier Render wipes /uploads on restart — give a clear, actionable message
-      const isFileMissing = msg.toLowerCase().includes('no longer on the server') ||
-                            msg.toLowerCase().includes('file not found') ||
-                            err?.response?.status === 404;
-      setRowError(
-        isFileMissing
-          ? `"${doc.originalName}" was deleted when the server restarted (free tier limitation). Please re-upload the file to analyse it again.`
-          : msg
-      );
-    } finally {
-      setRowBusy(null);
-    }
-  };
 
   const handleDeleteDoc = async (doc) => {
     setRowBusy(doc.id);
@@ -472,17 +449,6 @@ const UploadDocuments = () => {
                           ) : doc.status === 'Failed' ? (
                             <span style={{ fontSize: 12, color: '#ef4444' }} title={doc.errorMessage}>Failed</span>
                           ) : null}
-
-                          {doc.status !== 'Processing' && (
-                            <button
-                              onClick={() => handleReanalyze(doc)}
-                              disabled={rowBusy === doc.id}
-                              title="Run the analysis again"
-                              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 700, color: '#0891b2', padding: '4px 10px', background: '#ecfeff', border: 'none', cursor: rowBusy === doc.id ? 'wait' : 'pointer', borderRadius: 8, whiteSpace: 'nowrap' }}
-                            >
-                              <RotateCw size={12} /> Re-analyse
-                            </button>
-                          )}
 
                           <button
                             onClick={() => setConfirmDeleteDoc(doc)}
