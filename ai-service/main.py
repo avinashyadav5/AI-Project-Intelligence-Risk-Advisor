@@ -92,15 +92,23 @@ ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".csv"}
 
 # ── Global RAG Model Loading ──────────────────────────────────────────────────
 embed_model = None
-if HAS_RAG:
-    try:
-        print("Loading local embedding model (all-MiniLM-L6-v2) via fastembed...")
-        # Force single-threaded execution to prevent CPU lockups on Render free tier
-        embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2", threads=1)
-        print("Embedding model loaded successfully.")
-    except Exception as e:
-        print(f"Failed to load embedding model: {e}")
-        HAS_RAG = False
+
+def get_embed_model():
+    global embed_model
+    if not HAS_RAG:
+        return None
+    if embed_model is None:
+        try:
+            print("Lazy loading local embedding model (all-MiniLM-L6-v2) via fastembed...")
+            from fastembed import TextEmbedding
+            embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2", threads=1)
+            print("Embedding model loaded successfully.")
+        except Exception as e:
+            print(f"Failed to load embedding model: {e}")
+            global HAS_RAG
+            HAS_RAG = False
+            return None
+    return embed_model
 
 
 def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list:
@@ -122,12 +130,13 @@ def embed_in_batches(texts: list, batch_size: int = 32) -> np.ndarray:
     Process embeddings in small chunks to prevent huge memory spikes 
     that lead to OOM kills on memory-constrained environments like Render.
     """
-    if not texts or not embed_model:
+    model = get_embed_model()
+    if not texts or not model:
         return np.array([]).astype('float32')
     all_embeddings = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        batch_emb = list(embed_model.embed(batch))
+        batch_emb = list(model.embed(batch))
         all_embeddings.extend(batch_emb)
     return np.array(all_embeddings).astype('float32')
 
@@ -141,7 +150,8 @@ def retrieve_context(text: str, k: int = 8) -> tuple:
     Memoized to avoid re-embedding the entire document 5 times for the 5 agents
     since the risk query is currently identical for all of them.
     """
-    if not HAS_RAG or not embed_model:
+    model = get_embed_model()
+    if not HAS_RAG or not model:
         return text[:12000], 0.0
 
     if len(text) < 12000:
@@ -168,7 +178,7 @@ def retrieve_context(text: str, k: int = 8) -> tuple:
 
     query = ("Identify financial risks, operational delays, technical vulnerabilities, "
              "legal liabilities, compliance issues, and critical roadblocks.")
-    query_embedding = np.array(list(embed_model.embed([query]))).astype('float32')
+    query_embedding = np.array(list(model.embed([query]))).astype('float32')
 
     actual_k = min(k, len(chunks))
     distances, indices = index.search(query_embedding, actual_k)
@@ -228,7 +238,8 @@ def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str
     Re-uploading the same document replaces its chunks rather than duplicating
     them, so the KB never accumulates stale copies of a revised file.
     """
-    if not HAS_RAG or not embed_model or not project_id or not text:
+    model = get_embed_model()
+    if not HAS_RAG or not model or not project_id or not text:
         return
 
     project_kb_dir, index_path, chunks_path = _kb_paths(project_id)
@@ -265,7 +276,8 @@ def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str
 
 def delete_document_from_kb(project_id: str, doc_id: str) -> int:
     """Remove one document's chunks from the KB. Returns how many were removed."""
-    if not HAS_RAG or not embed_model:
+    model = get_embed_model()
+    if not HAS_RAG or not model:
         return 0
     _, _, chunks_path = _kb_paths(project_id)
     existing = _load_chunks(chunks_path)
@@ -288,7 +300,8 @@ def delete_project_kb(project_id: str) -> bool:
 
 
 def query_knowledge_base(project_id: str, question: str, k: int = 8):
-    if not HAS_RAG or not embed_model:
+    model = get_embed_model()
+    if not HAS_RAG or not model:
         return []
 
     project_kb_dir, index_path, chunks_path = _kb_paths(project_id)
@@ -305,7 +318,7 @@ def query_knowledge_base(project_id: str, question: str, k: int = 8):
     if not chunks_meta:
         return []
 
-    query_embedding = np.array(list(embed_model.embed([question]))).astype('float32')
+    query_embedding = np.array(list(model.embed([question]))).astype('float32')
     actual_k = min(k, len(chunks_meta))
     if actual_k == 0:
         return []
