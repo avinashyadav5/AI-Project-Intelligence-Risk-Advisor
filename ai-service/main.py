@@ -61,7 +61,8 @@ import numpy as np
 try:
     import faiss
     from fastembed import TextEmbedding
-    HAS_RAG = True
+    # Force disable semantic RAG to save 250MB RAM and prevent 502 OOMs on free tier
+    HAS_RAG = False
 except ImportError:
     HAS_RAG = False
 
@@ -125,11 +126,14 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list:
     return chunks
 
 
-def embed_in_batches(texts: list, batch_size: int = 32) -> np.ndarray:
+import gc
+
+def embed_in_batches(texts: list, batch_size: int = 8) -> np.ndarray:
     """
-    Process embeddings in small chunks to prevent huge memory spikes 
+    Process embeddings in very small chunks to prevent huge memory spikes 
     that lead to OOM kills on memory-constrained environments like Render.
     """
+    gc.collect()
     model = get_embed_model()
     if not texts or not model:
         return np.array([]).astype('float32')
@@ -146,14 +150,7 @@ _retrieve_cache = {}
 def retrieve_context(text: str, k: int = 8) -> tuple:
     """
     Chunk, embed and retrieve the top-K most risk-relevant passages.
-    
-    Memoized to avoid re-embedding the entire document 5 times for the 5 agents
-    since the risk query is currently identical for all of them.
     """
-    model = get_embed_model()
-    if not HAS_RAG or not model:
-        return text[:12000], 0.0
-
     if len(text) < 12000:
         return text, 0.0
 
@@ -167,28 +164,43 @@ def retrieve_context(text: str, k: int = 8) -> tuple:
         if not chunks:
             return text[:12000], 0.0
 
-        embeddings = embed_in_batches(chunks, batch_size=32)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
+        model = get_embed_model()
+        if HAS_RAG and model:
+            embeddings = embed_in_batches(chunks, batch_size=32)
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+            index.add(embeddings)
+        else:
+            index = None
         
-        # Keep cache extremely small to prevent OOM on 512MB Render instances
         if len(_retrieve_cache) >= 2:
             _retrieve_cache.clear()
         _retrieve_cache[cache_key] = (chunks, index)
 
     query = ("Identify financial risks, operational delays, technical vulnerabilities, "
              "legal liabilities, compliance issues, and critical roadblocks.")
-    query_embedding = np.array(list(model.embed([query]))).astype('float32')
-
+    
     actual_k = min(k, len(chunks))
-    distances, indices = index.search(query_embedding, actual_k)
 
-    retrieved_indices = sorted([i for i in indices[0] if i < len(chunks)])
-    retrieved_chunks = [chunks[i] for i in retrieved_indices]
+    model = get_embed_model()
+    if HAS_RAG and model and index is not None:
+        query_embedding = np.array(list(model.embed([query]))).astype('float32')
+        distances, indices = index.search(query_embedding, actual_k)
+        retrieved_indices = sorted([i for i in indices[0] if i < len(chunks)])
+        top_chunks = [chunks[i] for i in retrieved_indices]
+        avg_distance = float(np.mean(distances[0][:actual_k])) if actual_k > 0 else 0.0
+    else:
+        # Fallback: keyword matching
+        query_words = set(re.sub(r"[^\w\s]", "", query.lower()).split())
+        scored = []
+        for c in chunks:
+            chunk_words = c.lower().split()
+            score = sum(chunk_words.count(qw) for qw in query_words)
+            scored.append((c, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_chunks = [c for c, score in scored[:actual_k]]
+        avg_distance = 0.0
 
-    avg_distance = float(np.mean(distances[0][:actual_k])) if actual_k > 0 else 0.0
-
-    return "\n\n...[Context Gap]...\n\n".join(retrieved_chunks), avg_distance
+    return "\n\n...[Context Gap]...\n\n".join(top_chunks), avg_distance
 
 
 # ── Knowledge Base ────────────────────────────────────────────────────────────
@@ -234,12 +246,8 @@ def _rebuild_index(project_id: str, chunks_meta: list):
 def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str = ""):
     """
     Add a document's chunks to the project knowledge base.
-
-    Re-uploading the same document replaces its chunks rather than duplicating
-    them, so the KB never accumulates stale copies of a revised file.
     """
-    model = get_embed_model()
-    if not HAS_RAG or not model or not project_id or not text:
+    if not project_id or not text:
         return
 
     project_kb_dir, index_path, chunks_path = _kb_paths(project_id)
@@ -255,23 +263,26 @@ def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str
     new_meta = [{"doc_id": doc_id, "doc_name": doc_name or doc_id, "text": c} for c in chunks]
 
     if had_this_doc:
-        # Replace: drop the old chunks for this document, then rebuild.
         kept = [c for c in existing_chunks if c.get("doc_id") != doc_id]
-        _rebuild_index(project_id, kept + new_meta)
+        with open(chunks_path, 'w', encoding='utf-8') as f:
+            json.dump(kept + new_meta, f)
+        if HAS_RAG:
+            _rebuild_index(project_id, kept + new_meta)
         return
-
-    embeddings = embed_in_batches(chunks, batch_size=32)
-
-    if index_path.exists():
-        index = faiss.read_index(str(index_path))
-    else:
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-
-    index.add(embeddings)
-    faiss.write_index(index, str(index_path))
 
     with open(chunks_path, 'w', encoding='utf-8') as f:
         json.dump(existing_chunks + new_meta, f)
+
+    model = get_embed_model()
+    if HAS_RAG and model:
+        embeddings = embed_in_batches(chunks, batch_size=32)
+        if index_path.exists():
+            index = faiss.read_index(str(index_path))
+        else:
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+        faiss.write_index(index, str(index_path))
+
 
 
 def delete_document_from_kb(project_id: str, doc_id: str) -> int:
