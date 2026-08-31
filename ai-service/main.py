@@ -58,13 +58,14 @@ except ImportError:
     HAS_DOCX = False
 
 import numpy as np
-try:
-    import faiss
-    from fastembed import TextEmbedding
-    # Force disable semantic RAG to save 250MB RAM and prevent 502 OOMs on free tier
-    HAS_RAG = False
-except ImportError:
-    HAS_RAG = False
+# try:
+#     import faiss
+#     from fastembed import TextEmbedding
+# except ImportError:
+#     pass
+
+# Force disable semantic RAG to save 250MB RAM and prevent 502 OOMs on free tier
+HAS_RAG = False
 
 import httpx
 HAS_GROQ = bool(GROQ_API_KEY)
@@ -287,9 +288,6 @@ def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str
 
 def delete_document_from_kb(project_id: str, doc_id: str) -> int:
     """Remove one document's chunks from the KB. Returns how many were removed."""
-    model = get_embed_model()
-    if not HAS_RAG or not model:
-        return 0
     _, _, chunks_path = _kb_paths(project_id)
     existing = _load_chunks(chunks_path)
     if not existing:
@@ -297,7 +295,10 @@ def delete_document_from_kb(project_id: str, doc_id: str) -> int:
     kept = [c for c in existing if c.get("doc_id") != doc_id]
     removed = len(existing) - len(kept)
     if removed:
-        _rebuild_index(project_id, kept)
+        with open(chunks_path, 'w', encoding='utf-8') as f:
+            json.dump(kept, f)
+        if HAS_RAG:
+            _rebuild_index(project_id, kept)
     return removed
 
 
