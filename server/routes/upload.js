@@ -64,31 +64,56 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
       data: { status: 'Processing' },
     });
 
-    const form = new FormData();
-    form.append('file', fs.createReadStream(filePath), originalName);
-    form.append('projectId', projectId);
-    // The document id travels with the file so its knowledge-base chunks are
-    // attributable — chat citations name the real document, and re-uploading
-    // replaces the old chunks instead of duplicating them.
-    form.append('documentId', docId);
+    // ── Retry wrapper: the AI service on Render free tier sleeps after 15 min
+    // of inactivity. The first request after sleep returns 502 while the
+    // container cold-boots. We retry up to 3 times with increasing delays
+    // to give it time to wake up.
+    let initResponse = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        // FormData streams can only be consumed once, so rebuild on each retry
+        const retryForm = new FormData();
+        retryForm.append('file', fs.createReadStream(filePath), originalName);
+        retryForm.append('projectId', projectId);
+        retryForm.append('documentId', docId);
 
-    const initResponse = await ai.post('/analyze', form, {
-      headers: form.getHeaders(),
-      timeout: 60000, 
-    });
+        initResponse = await ai.post('/analyze', retryForm, {
+          headers: retryForm.getHeaders(),
+          timeout: 60000,
+        });
+        break; // success
+      } catch (postErr) {
+        const status = postErr.response?.status;
+        console.warn(`POST /analyze attempt ${attempt}/3 failed (status=${status}): ${postErr.message}`);
+        if (attempt === 3) throw postErr;
+        // Wait longer on each retry to let the container finish booting
+        await new Promise(r => setTimeout(r, attempt * 15000));
+      }
+    }
 
     const taskId = initResponse.data.task_id;
     if (!taskId) throw new Error("Failed to start AI analysis (no task_id)");
 
     let data = null;
+    let consecutiveErrors = 0;
     for (let i = 0; i < 60; i++) { // wait up to 5 minutes
       await new Promise(r => setTimeout(r, 5000));
-      const statusRes = await ai.get(`/task/${taskId}`);
-      if (statusRes.data.status === 'completed') {
-        data = statusRes.data.result;
-        break;
-      } else if (statusRes.data.status === 'failed') {
-        throw new Error(statusRes.data.error || 'AI processing failed internally');
+      try {
+        const statusRes = await ai.get(`/task/${taskId}`);
+        consecutiveErrors = 0; // reset on success
+        if (statusRes.data.status === 'completed') {
+          data = statusRes.data.result;
+          break;
+        } else if (statusRes.data.status === 'failed') {
+          throw new Error(statusRes.data.error || 'AI processing failed internally');
+        }
+      } catch (pollErr) {
+        // If the error was thrown by the 'failed' status check above, re-throw
+        if (pollErr.message && !pollErr.response) throw pollErr;
+        consecutiveErrors++;
+        console.warn(`Poll /task/${taskId} error ${consecutiveErrors}: ${pollErr.message}`);
+        // Allow up to 5 consecutive network errors before giving up
+        if (consecutiveErrors >= 5) throw new Error('AI service unreachable after 5 consecutive poll failures');
       }
     }
 
