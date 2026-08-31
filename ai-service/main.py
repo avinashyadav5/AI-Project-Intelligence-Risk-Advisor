@@ -95,6 +95,7 @@ embed_model = None
 
 def get_embed_model():
     global embed_model
+    global HAS_RAG
     if not HAS_RAG:
         return None
     if embed_model is None:
@@ -105,7 +106,6 @@ def get_embed_model():
             print("Embedding model loaded successfully.")
         except Exception as e:
             print(f"Failed to load embedding model: {e}")
-            global HAS_RAG
             HAS_RAG = False
             return None
     return embed_model
@@ -1172,7 +1172,6 @@ def analyze_project(req: ProjectAnalyzeRequest):
             "start_date": m.get("startDate") or m.get("start_date"),
             "depends_on": m.get("depends_on") or m.get("dependsOn") or [],
             "effort": m.get("effort"),
-        })
         })
 
     # Render proxy timeout safeguard
