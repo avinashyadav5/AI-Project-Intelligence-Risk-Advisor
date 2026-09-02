@@ -1076,8 +1076,9 @@ def process_document_pipeline(task_id, file_bytes, ext, filename, projectId, doc
         analysis_text = extracted_text
         if tasks:
             analysis_text = csv_tasks.tasks_to_text(parsed_tasks) + "\n\n" + extracted_text
-            
-        safe_analysis_text = analysis_text[:30000] if analysis_text else ""
+        # Groq free tier has a strict 6,000 Tokens-Per-Minute limit.
+        # 12,000 characters is ~3,000 tokens. This prevents aggressive 429 rate limits.
+        safe_analysis_text = analysis_text[:12000] if analysis_text else ""
 
         result = run_agent_pipeline(safe_analysis_text, tasks=tasks)
         analysis_source = result.pop("analysis_source", "groq_pipeline" if HAS_GROQ else "keyword_fallback")

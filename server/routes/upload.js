@@ -96,7 +96,7 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
 
     let data = null;
     let consecutiveErrors = 0;
-    for (let i = 0; i < 60; i++) { // wait up to 5 minutes
+    for (let i = 0; i < 180; i++) { // wait up to 15 minutes
       await new Promise(r => setTimeout(r, 5000));
       try {
         const statusRes = await ai.get(`/task/${taskId}`);
@@ -116,8 +116,7 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
         if (consecutiveErrors >= 5) throw new Error('AI service unreachable after 5 consecutive poll failures');
       }
     }
-
-    if (!data) throw new Error("Analysis timed out after 5 minutes.");
+    if (!data) throw new Error("Analysis timed out after 15 minutes.");
 
     await prisma.document.update({
       where: { id: docId },
