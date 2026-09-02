@@ -55,8 +55,6 @@ function handleUpload(req, res, next) {
 }
 
 // ── Background analysis ───────────────────────────────────────────────────────
-// filePath is captured in the closure: by the time setImmediate fires the file
-// is already on disk, so a fresh ReadStream is safe.
 async function triggerAnalysis(docId, filePath, originalName, projectId, userId) {
   try {
     await prisma.document.update({
@@ -64,59 +62,20 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
       data: { status: 'Processing' },
     });
 
-    // ── Retry wrapper: the AI service on Render free tier sleeps after 15 min
-    // of inactivity. The first request after sleep returns 502 while the
-    // container cold-boots. We retry up to 3 times with increasing delays
-    // to give it time to wake up.
-    let initResponse = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        // FormData streams can only be consumed once, so rebuild on each retry
-        const retryForm = new FormData();
-        retryForm.append('file', fs.createReadStream(filePath), originalName);
-        retryForm.append('projectId', projectId);
-        retryForm.append('documentId', docId);
+    const form = new FormData();
+    form.append('file', fs.createReadStream(filePath), originalName);
+    form.append('projectId', projectId);
+    form.append('documentId', docId);
 
-        initResponse = await ai.post('/analyze', retryForm, {
-          headers: retryForm.getHeaders(),
-          timeout: 60000,
-        });
-        break; // success
-      } catch (postErr) {
-        const status = postErr.response?.status;
-        console.warn(`POST /analyze attempt ${attempt}/3 failed (status=${status}): ${postErr.message}`);
-        if (attempt === 3) throw postErr;
-        // Wait longer on each retry to let the container finish booting
-        await new Promise(r => setTimeout(r, attempt * 15000));
-      }
-    }
+    // AI service now does only 2 Groq calls and completes in ~30-60s.
+    // Node's background task waits here independently — the HTTP response
+    // to the client was already sent via setImmediate before this runs.
+    const aiResponse = await ai.post('/analyze', form, {
+      headers: form.getHeaders(),
+      timeout: 120000, // 2 minutes max
+    });
 
-    const taskId = initResponse.data.task_id;
-    if (!taskId) throw new Error("Failed to start AI analysis (no task_id)");
-
-    let data = null;
-    let consecutiveErrors = 0;
-    for (let i = 0; i < 180; i++) { // wait up to 15 minutes
-      await new Promise(r => setTimeout(r, 5000));
-      try {
-        const statusRes = await ai.get(`/task/${taskId}`);
-        consecutiveErrors = 0; // reset on success
-        if (statusRes.data.status === 'completed') {
-          data = statusRes.data.result;
-          break;
-        } else if (statusRes.data.status === 'failed') {
-          throw new Error(statusRes.data.error || 'AI processing failed internally');
-        }
-      } catch (pollErr) {
-        // If the error was thrown by the 'failed' status check above, re-throw
-        if (pollErr.message && !pollErr.response) throw pollErr;
-        consecutiveErrors++;
-        console.warn(`Poll /task/${taskId} error ${consecutiveErrors}: ${pollErr.message}`);
-        // Allow up to 5 consecutive network errors before giving up
-        if (consecutiveErrors >= 5) throw new Error('AI service unreachable after 5 consecutive poll failures');
-      }
-    }
-    if (!data) throw new Error("Analysis timed out after 15 minutes.");
+    const data = aiResponse.data;
 
     await prisma.document.update({
       where: { id: docId },
@@ -139,7 +98,6 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
         riskRegister: data.risk_register || [],
         projectHealth: data.project_health || null,
         confidence: typeof data.confidence_score === 'number' ? data.confidence_score : null,
-
         missingDocs: data.missing_documentation || [],
         traceability: data.traceability_gaps || [],
         sprintSummary: typeof data.sprint_summary === 'object'
@@ -148,13 +106,12 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
         meetingMinutes: data.meeting_minutes || null,
         decisions: data.decisions || [],
         actionItems: data.action_items || [],
-
         processingTimeMs: data.processing_time_ms || null,
         errorMessage: null,
       },
     });
 
-    console.log(`Analyzed document ${docId}: ${data.risk_level} (score: ${data.risk_score})`);
+    console.log(`✅ Analyzed document ${docId}: ${data.risk_level} (score: ${data.risk_score})`);
 
     await events.logActivity(projectId, userId, 'document.analyzed', {
       documentId: docId,
@@ -189,19 +146,12 @@ async function triggerAnalysis(docId, filePath, originalName, projectId, userId)
           message,
         },
       });
-      await events.notifyProject(projectId, {
-        type: 'risk',
-        message,
-        link: `/report/${docId}`,
-      });
-      await events.logActivity(projectId, userId, 'risk.critical', {
-        documentId: docId,
-        riskScore: data.risk_score,
-      });
+      await events.notifyProject(projectId, { type: 'risk', message, link: `/report/${docId}` });
+      await events.logActivity(projectId, userId, 'risk.critical', { documentId: docId, riskScore: data.risk_score });
     }
   } catch (err) {
     const message = err.response?.data?.detail || err.message || 'Unknown error';
-    console.error(`Analysis failed for document ${docId}:`, message);
+    console.error(`❌ Analysis failed for document ${docId}:`, message);
     await prisma.document.update({
       where: { id: docId },
       data: { status: 'Failed', errorMessage: message },

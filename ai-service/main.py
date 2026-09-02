@@ -1,33 +1,21 @@
 """
-AI Project Intelligence & Risk Advisor — FastAPI AI Service v3.1.0
+AI Project Intelligence & Risk Advisor — FastAPI AI Service v3.2.0
 ==================================================================
-Teams upload their existing project artifacts (proposals, SRS documents,
-meeting notes, progress updates, task-list CSVs). This service builds a unified
-per-project knowledge base with RAG and runs a multi-agent pipeline over it.
-
-Architecture decisions:
-  - Text extraction runs locally (PyMuPDF / python-docx) — fast, free, private
-  - Task-list CSVs are parsed into structured rows (csv_tasks.py), not prose
-  - Schedule forecasting is deterministic date maths (schedule.py); the LLM only
-    adds qualitative delay factors on top
-  - Multi-agent pipeline (Risk, Scope, Health, Traceability, Meeting, Stories)
-    via Groq, with a real keyword fallback (keyword_engine.py) when Groq is down
-  - Scoring is deterministic (scoring.py) so the same analysis is reproducible
-  - /analyze scores a single document; /analyze-project runs the same pipeline
-    across the unified project knowledge base
+RENDER FREE TIER REWRITE:
+- Completely synchronous pipeline (no background tasks, no polling)
+- Only 2 sequential Groq calls instead of 5 (Risk + Health merged, Scope merged)
+- Text capped at 8000 characters (≈2000 tokens per call, well under 6000 TPM)
+- No FAISS, no fastembed (saves 250MB RAM)
+- Keyword fallback always available
 """
 
 import os, re, io, uuid, time, json, shutil
 from pathlib import Path
 from typing import Optional, List
 
-# ── Prevent CPU starvation on Render free tier ───────────────────────────────
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import scoring
 import csv_tasks
@@ -44,7 +32,7 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# ── Optional heavy deps (graceful degradation) ────────────────────────────────
+# ── Optional heavy deps ───────────────────────────────────────────────────────
 try:
     import fitz
     HAS_PYMUPDF = True
@@ -58,27 +46,13 @@ except ImportError:
     HAS_DOCX = False
 
 import numpy as np
-# try:
-#     import faiss
-#     from fastembed import TextEmbedding
-# except ImportError:
-#     pass
-
-# Force disable semantic RAG to save 250MB RAM and prevent 502 OOMs on free tier
-HAS_RAG = False
-
 import httpx
+
+HAS_RAG  = False  # disabled to save RAM
 HAS_GROQ = bool(GROQ_API_KEY)
 
-
 # ── App bootstrap ─────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="AI Project Intelligence & Risk Advisor — AI Service",
-    version="3.1.0",
-)
-
-KB_DIR = Path("knowledge_base")
-KB_DIR.mkdir(exist_ok=True)
+app = FastAPI(title="AI Project Intelligence & Risk Advisor — AI Service", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,313 +64,9 @@ app.add_middleware(
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+KB_DIR = Path("knowledge_base")
+KB_DIR.mkdir(exist_ok=True)
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".csv"}
-
-# ── Global RAG Model Loading ──────────────────────────────────────────────────
-embed_model = None
-
-def get_embed_model():
-    global embed_model
-    global HAS_RAG
-    if not HAS_RAG:
-        return None
-    if embed_model is None:
-        try:
-            print("Lazy loading local embedding model (all-MiniLM-L6-v2) via fastembed...")
-            from fastembed import TextEmbedding
-            embed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2", threads=1)
-            print("Embedding model loaded successfully.")
-        except Exception as e:
-            print(f"Failed to load embedding model: {e}")
-            HAS_RAG = False
-            return None
-    return embed_model
-
-
-def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list:
-    """Split text into chunks of `chunk_size` words with `overlap` words."""
-    if not text:
-        return []
-    words = text.split()
-    chunks = []
-    i = 0
-    step = max(1, chunk_size - overlap)
-    while i < len(words):
-        chunks.append(" ".join(words[i:i + chunk_size]))
-        i += step
-    return chunks
-
-
-import gc
-
-def embed_in_batches(texts: list, batch_size: int = 8) -> np.ndarray:
-    """
-    Process embeddings in very small chunks to prevent huge memory spikes 
-    that lead to OOM kills on memory-constrained environments like Render.
-    """
-    gc.collect()
-    model = get_embed_model()
-    if not texts or not model:
-        return np.array([]).astype('float32')
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        batch_emb = list(model.embed(batch))
-        all_embeddings.extend(batch_emb)
-    return np.array(all_embeddings).astype('float32')
-
-
-_retrieve_cache = {}
-
-def retrieve_context(text: str, k: int = 8) -> tuple:
-    """
-    Chunk, embed and retrieve the top-K most risk-relevant passages.
-    """
-    if len(text) < 12000:
-        return text, 0.0
-
-    cache_key = hash(text)
-    if cache_key in _retrieve_cache:
-        cached_chunks, cached_index = _retrieve_cache[cache_key]
-        chunks = cached_chunks
-        index = cached_index
-    else:
-        chunks = chunk_text(text, chunk_size=300, overlap=50)
-        if not chunks:
-            return text[:12000], 0.0
-
-        model = get_embed_model()
-        if HAS_RAG and model:
-            embeddings = embed_in_batches(chunks, batch_size=32)
-            index = faiss.IndexFlatL2(embeddings.shape[1])
-            index.add(embeddings)
-        else:
-            index = None
-        
-        if len(_retrieve_cache) >= 2:
-            _retrieve_cache.clear()
-        _retrieve_cache[cache_key] = (chunks, index)
-
-    query = ("Identify financial risks, operational delays, technical vulnerabilities, "
-             "legal liabilities, compliance issues, and critical roadblocks.")
-    
-    actual_k = min(k, len(chunks))
-
-    model = get_embed_model()
-    if HAS_RAG and model and index is not None:
-        query_embedding = np.array(list(model.embed([query]))).astype('float32')
-        distances, indices = index.search(query_embedding, actual_k)
-        retrieved_indices = sorted([i for i in indices[0] if i < len(chunks)])
-        top_chunks = [chunks[i] for i in retrieved_indices]
-        avg_distance = float(np.mean(distances[0][:actual_k])) if actual_k > 0 else 0.0
-    else:
-        # Fallback: keyword matching
-        query_words = set(re.sub(r"[^\w\s]", "", query.lower()).split())
-        scored = []
-        for c in chunks:
-            chunk_words = c.lower().split()
-            score = sum(chunk_words.count(qw) for qw in query_words)
-            scored.append((c, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top_chunks = [c for c, score in scored[:actual_k]]
-        avg_distance = 0.0
-
-    return "\n\n...[Context Gap]...\n\n".join(top_chunks), avg_distance
-
-
-# ── Knowledge Base ────────────────────────────────────────────────────────────
-# Chunk metadata is a list aligned 1:1 with FAISS index positions. Each entry
-# records which document it came from, so chat answers can cite a real filename
-# instead of a placeholder.
-
-def _kb_paths(project_id: str):
-    project_kb_dir = KB_DIR / project_id
-    return project_kb_dir, project_kb_dir / "index.faiss", project_kb_dir / "chunks.json"
-
-
-def _load_chunks(chunks_path: Path) -> list:
-    if not chunks_path.exists():
-        return []
-    try:
-        with open(chunks_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def _rebuild_index(project_id: str, chunks_meta: list):
-    """Re-encode all remaining chunks and overwrite the index. Used after a delete."""
-    project_kb_dir, index_path, chunks_path = _kb_paths(project_id)
-    project_kb_dir.mkdir(parents=True, exist_ok=True)
-
-    if not chunks_meta:
-        if index_path.exists():
-            index_path.unlink()
-        with open(chunks_path, 'w', encoding='utf-8') as f:
-            json.dump([], f)
-        return
-
-    embeddings = embed_in_batches([c["text"] for c in chunks_meta], batch_size=32)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
-    faiss.write_index(index, str(index_path))
-    with open(chunks_path, 'w', encoding='utf-8') as f:
-        json.dump(chunks_meta, f)
-
-
-def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str = ""):
-    """
-    Add a document's chunks to the project knowledge base.
-    """
-    if not project_id or not text:
-        return
-
-    project_kb_dir, index_path, chunks_path = _kb_paths(project_id)
-    project_kb_dir.mkdir(parents=True, exist_ok=True)
-
-    chunks = chunk_text(text, chunk_size=300, overlap=50)
-    if not chunks:
-        return
-
-    existing_chunks = _load_chunks(chunks_path)
-    had_this_doc = any(c.get("doc_id") == doc_id for c in existing_chunks)
-
-    new_meta = [{"doc_id": doc_id, "doc_name": doc_name or doc_id, "text": c} for c in chunks]
-
-    if had_this_doc:
-        kept = [c for c in existing_chunks if c.get("doc_id") != doc_id]
-        with open(chunks_path, 'w', encoding='utf-8') as f:
-            json.dump(kept + new_meta, f)
-        if HAS_RAG:
-            _rebuild_index(project_id, kept + new_meta)
-        return
-
-    with open(chunks_path, 'w', encoding='utf-8') as f:
-        json.dump(existing_chunks + new_meta, f)
-
-    model = get_embed_model()
-    if HAS_RAG and model:
-        embeddings = embed_in_batches(chunks, batch_size=32)
-        if index_path.exists():
-            index = faiss.read_index(str(index_path))
-        else:
-            index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
-        faiss.write_index(index, str(index_path))
-
-
-
-def delete_document_from_kb(project_id: str, doc_id: str) -> int:
-    """Remove one document's chunks from the KB. Returns how many were removed."""
-    _, _, chunks_path = _kb_paths(project_id)
-    existing = _load_chunks(chunks_path)
-    if not existing:
-        return 0
-    kept = [c for c in existing if c.get("doc_id") != doc_id]
-    removed = len(existing) - len(kept)
-    if removed:
-        with open(chunks_path, 'w', encoding='utf-8') as f:
-            json.dump(kept, f)
-        if HAS_RAG:
-            _rebuild_index(project_id, kept)
-    return removed
-
-
-def delete_project_kb(project_id: str) -> bool:
-    """Remove the whole knowledge base for a project."""
-    project_kb_dir, _, _ = _kb_paths(project_id)
-    if project_kb_dir.exists():
-        shutil.rmtree(project_kb_dir, ignore_errors=True)
-        return True
-    return False
-
-
-def query_knowledge_base(project_id: str, question: str, k: int = 8):
-    model = get_embed_model()
-    if not HAS_RAG or not model:
-        return []
-
-    project_kb_dir, index_path, chunks_path = _kb_paths(project_id)
-    if not index_path.exists() or not chunks_path.exists():
-        return []
-
-    try:
-        index = faiss.read_index(str(index_path))
-        chunks_meta = _load_chunks(chunks_path)
-    except Exception as e:
-        print(f"Error reading knowledge base for {project_id}: {e}")
-        return []
-
-    if not chunks_meta:
-        return []
-
-    query_embedding = np.array(list(model.embed([question]))).astype('float32')
-    actual_k = min(k, len(chunks_meta))
-    if actual_k == 0:
-        return []
-
-    distances, indices = index.search(query_embedding, actual_k)
-
-    results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if 0 <= idx < len(chunks_meta):
-            meta = chunks_meta[idx]
-            results.append({
-                "doc_id": meta.get("doc_id", "unknown"),
-                "doc_name": meta.get("doc_name", meta.get("doc_id", "Document")),
-                "text": meta["text"],
-                "distance": float(dist)
-            })
-    return results
-
-
-# Broad queries used to assemble a project-wide context. Each targets a
-# different agent's needs so one retrieval pass serves the whole pipeline.
-PROJECT_CONTEXT_QUERIES = [
-    "project objectives scope deliverables and requirements",
-    "risks blockers issues and constraints",
-    "schedule milestones deadlines and dependencies",
-    "meeting decisions action items and owners",
-    "testing documentation quality and progress status",
-]
-
-
-def build_project_context(project_id: str, per_query_k: int = 6, char_budget: int = 24000) -> tuple:
-    """
-    Assemble a unified context across every document in the project.
-
-    This is what makes the pipeline project-level rather than per-document:
-    the agents see the combined artifacts, not one file at a time.
-    """
-    seen_texts = set()
-    ordered_chunks = []
-    distances = []
-
-    for query in PROJECT_CONTEXT_QUERIES:
-        for chunk in query_knowledge_base(project_id, query, k=per_query_k):
-            key = chunk["text"][:120]
-            if key in seen_texts:
-                continue
-            seen_texts.add(key)
-            ordered_chunks.append(chunk)
-            distances.append(chunk["distance"])
-
-    if not ordered_chunks:
-        return "", 0.0, []
-
-    parts, used, doc_names = [], 0, []
-    for chunk in ordered_chunks:
-        block = f"[Source: {chunk['doc_name']}]\n{chunk['text']}"
-        if used + len(block) > char_budget:
-            break
-        parts.append(block)
-        used += len(block)
-        if chunk["doc_name"] not in doc_names:
-            doc_names.append(chunk["doc_name"])
-
-    avg_distance = float(np.mean(distances)) if distances else 0.0
-    return "\n\n---\n\n".join(parts), avg_distance, doc_names
-
 
 # ── Text Extraction ───────────────────────────────────────────────────────────
 def extract_text(file_bytes: bytes, ext: str) -> str:
@@ -427,14 +97,105 @@ def extract_text(file_bytes: bytes, ext: str) -> str:
     return ""
 
 
-# ── Helper for Groq ───────────────────────────────────────────────────────────
+# ── Knowledge Base (JSON-only, no FAISS) ──────────────────────────────────────
+def _kb_paths(project_id: str):
+    d = KB_DIR / project_id
+    return d, d / "chunks.json"
+
+def _load_chunks(chunks_path: Path) -> list:
+    if not chunks_path.exists():
+        return []
+    try:
+        with open(chunks_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list:
+    if not text or not text.strip():
+        return []
+    words = text.split()
+    chunks, i, step = [], 0, max(1, chunk_size - overlap)
+    while i < len(words):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+        i += step
+    return chunks
+
+def add_to_knowledge_base(project_id: str, text: str, doc_id: str, doc_name: str = ""):
+    if not project_id or not text:
+        return
+    kb_dir, chunks_path = _kb_paths(project_id)
+    kb_dir.mkdir(parents=True, exist_ok=True)
+    chunks = chunk_text(text, chunk_size=300, overlap=50)
+    if not chunks:
+        return
+    existing = _load_chunks(chunks_path)
+    kept = [c for c in existing if c.get("doc_id") != doc_id]
+    new_meta = [{"doc_id": doc_id, "doc_name": doc_name or doc_id, "text": c} for c in chunks]
+    with open(chunks_path, "w", encoding="utf-8") as f:
+        json.dump(kept + new_meta, f)
+
+def delete_document_from_kb(project_id: str, doc_id: str) -> int:
+    _, chunks_path = _kb_paths(project_id)
+    existing = _load_chunks(chunks_path)
+    kept = [c for c in existing if c.get("doc_id") != doc_id]
+    removed = len(existing) - len(kept)
+    if removed:
+        with open(chunks_path, "w", encoding="utf-8") as f:
+            json.dump(kept, f)
+    return removed
+
+def delete_project_kb(project_id: str) -> bool:
+    kb_dir, _ = _kb_paths(project_id)
+    if kb_dir.exists():
+        shutil.rmtree(kb_dir, ignore_errors=True)
+        return True
+    return False
+
+def query_knowledge_base(project_id: str, question: str, k: int = 5) -> list:
+    _, chunks_path = _kb_paths(project_id)
+    chunks = _load_chunks(chunks_path)
+    if not chunks:
+        return []
+    # Simple keyword scoring (no FAISS needed)
+    q_words = set(re.sub(r"[^\w\s]", "", question.lower()).split())
+    scored = []
+    for c in chunks:
+        score = sum(c["text"].lower().count(w) for w in q_words)
+        scored.append((score, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:k]]
+
+def build_project_context(project_id: str, char_budget: int = 20000):
+    queries = [
+        "project objectives scope deliverables requirements",
+        "risks blockers issues constraints",
+        "schedule milestones deadlines",
+        "testing documentation quality status",
+    ]
+    seen, parts, doc_names = set(), [], []
+    for q in queries:
+        for chunk in query_knowledge_base(project_id, q, k=3):
+            key = chunk["text"][:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            block = f"[Source: {chunk['doc_name']}]\n{chunk['text']}"
+            if sum(len(p) for p in parts) + len(block) > char_budget:
+                break
+            parts.append(block)
+            if chunk["doc_name"] not in doc_names:
+                doc_names.append(chunk["doc_name"])
+    return "\n\n---\n\n".join(parts), 0.0, doc_names
+
+
+# ── Groq helper ───────────────────────────────────────────────────────────────
 def call_groq(system_msg: str, user_msg: str, max_tokens: int = 2048) -> Optional[dict]:
-    """Centralized function to call Groq API and parse JSON output."""
     if not HAS_GROQ:
         return None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            with httpx.Client(timeout=60.0) as client:
+            with httpx.Client(timeout=55.0) as client:
                 response = client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={
@@ -445,495 +206,179 @@ def call_groq(system_msg: str, user_msg: str, max_tokens: int = 2048) -> Optiona
                         "model": GROQ_MODEL,
                         "messages": [
                             {"role": "system", "content": system_msg},
-                            {"role": "user", "content": user_msg}
+                            {"role": "user",   "content": user_msg},
                         ],
                         "temperature": 0.0,
                         "max_tokens": max_tokens,
                         "top_p": 0.9,
-                    }
+                    },
                 )
-
                 if response.status_code == 429:
-                    print(f"Rate limited (429). Sleeping {30 * (attempt + 1)} seconds...")
-                    time.sleep(30 * (attempt + 1))
+                    wait = 20 * (attempt + 1)
+                    print(f"Groq 429 — sleeping {wait}s")
+                    time.sleep(wait)
                     continue
-
                 response.raise_for_status()
                 raw = response.json()["choices"][0]["message"]["content"].strip()
-
                 raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
                 raw = re.sub(r'\s*```$', '', raw)
-
                 try:
-                    match = re.search(r'\{.*\}', raw, re.DOTALL)
-                    if match:
-                        return json.loads(match.group(0))
-                    return json.loads(raw)
-                except json.JSONDecodeError as e:
-                    print(f"JSONDecodeError: {e} — could not parse JSON from response.")
-                    time.sleep(15 * (attempt + 1))
+                    m = re.search(r'\{.*\}', raw, re.DOTALL)
+                    return json.loads(m.group(0)) if m else json.loads(raw)
+                except json.JSONDecodeError:
+                    time.sleep(10)
                     continue
         except Exception as e:
-            print(f"ERROR IN call_groq (attempt {attempt}): {e}")
-            time.sleep(15 * (attempt + 1))
+            print(f"call_groq attempt {attempt}: {e}")
+            time.sleep(10)
     return None
-
 
 def call_groq_text(system_msg: str, user_msg: str, max_tokens: int = 1024,
                    temperature: float = 0.3, history: Optional[list] = None) -> str:
-    """Plain-text Groq call (no JSON parsing), with optional conversation history."""
     messages = [{"role": "system", "content": system_msg}]
-    for turn in (history or []):
-        role = turn.get("role")
-        content = turn.get("content")
-        if role in ("user", "assistant") and content:
-            messages.append({"role": role, "content": content})
+    for t in (history or []):
+        if t.get("role") in ("user", "assistant") and t.get("content"):
+            messages.append(t)
     messages.append({"role": "user", "content": user_msg})
-
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=55.0) as client:
         resp = client.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": GROQ_MODEL, "messages": messages, "temperature": temperature, "max_tokens": max_tokens},
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-# ── Multi-Agent Pipeline ──────────────────────────────────────────────────────
+# ── Single combined prompt (2 Groq calls total instead of 5) ─────────────────
+FULL_ANALYSIS_PROMPT = """You are an expert AI project risk and health analyst.
 
-# Agent 1: Risk Analyst
-# The LLM is capped at 3 risks per category to bound the payload and stop score
-# dilution from a long tail of trivial findings.
-ANALYSIS_PROMPT = """You are an expert AI project risk analyst. Analyze the following document and return ONLY a valid JSON object.
-
-Document content:
+Document content (first 8000 characters):
 \"\"\"
 {text}
 \"\"\"
 
-Return this exact JSON structure:
+Return ONLY valid JSON matching this EXACT structure:
 {{
-  "summary": "A clear 2-3 sentence summary of the document's main content and purpose",
-  "risk_level": "<Low | Medium | High | Critical>",
+  "summary": "2-3 sentence summary of the document",
+  "risk_level": "Low|Medium|High|Critical",
   "key_insights": [
-    {{"severity": "<critical|high|medium|low>", "text": "Specific insight found in the document", "evidence_quote": "Exact quote or null", "is_inferred": false}}
+    {{"severity": "critical|high|medium|low", "text": "insight", "evidence_quote": "quote or null", "is_inferred": false}}
   ],
-  "recommendations": [
-    "Actionable recommendation 1"
-  ],
+  "recommendations": ["Actionable recommendation 1", "Actionable recommendation 2"],
   "risk_register": {{
-    "technical": [
-      {{
-        "title": "Short title of risk",
-        "description": "Detailed description",
-        "category": "technical",
-        "probability": "low|medium|high",
-        "impact": "low|medium|high",
-        "evidence_quote": "Exact quote from text, or null if inferred",
-        "is_inferred": false,
-        "affected_tasks": ["Task A", "Task B"],
-        "affected_requirements": ["Req 1", "Req 2"],
-        "recommendation": "Mitigation strategy",
-        "source_documents": ["Reference to document type or section"]
-      }}
-    ],
+    "technical": [{{"title": "...", "description": "...", "category": "technical", "probability": "low|medium|high", "impact": "low|medium|high", "evidence_quote": null, "is_inferred": true, "affected_tasks": [], "affected_requirements": [], "recommendation": "...", "source_documents": []}}],
     "timeline": [],
     "financial": [],
     "operational": [],
     "legal": []
+  }},
+  "scope": {{
+    "objectives": ["objective 1"],
+    "boundaries": ["boundary 1"],
+    "assumptions": ["assumption 1"]
+  }},
+  "deliverables": [{{"name": "...", "description": "...", "priority": "high|medium|low", "status": "identified", "evidence": "...", "confidence": 80}}],
+  "health_breakdown": {{
+    "planning": {{"score": 50, "reason": "...", "evidence": "...", "confidence": 50}},
+    "documentation": {{"score": 50, "reason": "...", "evidence": "...", "confidence": 50}},
+    "development": {{"score": 50, "reason": "...", "evidence": "...", "confidence": 50}},
+    "testing": {{"score": 50, "reason": "...", "evidence": "...", "confidence": 50}}
   }}
 }}
 
 Rules:
-- Never fabricate risks. Only report evidence-backed risks.
-- If no risks exist for a category, return an empty array [] for that category. Do not omit the key.
-- The "category" field of every risk MUST exactly match the key it is listed under (technical, timeline, financial, operational or legal).
-- evidence_quote MUST be cited from the text if is_inferred is false.
-- Extract a maximum of 3 most critical risks per category to keep the report concise.
+- Max 3 risks per category. No fabricated risks.
+- If a section has no evidence, use empty arrays or default scores of 50 with reason "No evidence found."
+- Return ONLY valid JSON, nothing else."""
+
+
+SCOPE_PROMPT = """You are an expert project analyst.
+
+Document content:
+\"\"\"
+{text}
+\"\"\"
+
+Return ONLY valid JSON:
+{{
+  "blockers": [{{"description": "...", "severity": "critical|high|medium|low", "impact": "...", "mitigation": "...", "evidence": "...", "confidence": 80}}],
+  "missing_documentation": [{{"document_type": "...", "reason": "...", "confidence": 80}}],
+  "traceability_gaps": [{{"requirement": "...", "missing_link": "Task|Testing|Deployment", "reasoning": "...", "satisfied": false}}],
+  "document_summary": {{"document_type": "...", "purpose": "...", "primary_domain": "...", "detected_technologies": [], "quality_score": 70, "overall_assessment": "..."}}
+}}
+
+Rules:
+- If no blockers found, return [{{"description": "No blockers detected.", "severity": "low", "impact": "None", "mitigation": "None", "evidence": "None", "confidence": 100}}]
 - Return ONLY valid JSON."""
 
 
-def analyze_with_groq(text: str) -> Optional[dict]:
-    if not HAS_GROQ:
-        # No API key: don't embed, don't retry, just let the caller fall back.
-        return None
-
-    retrieved_text, avg_distance = retrieve_context(text, k=6)
-    prompt = ANALYSIS_PROMPT.format(text=retrieved_text)
-    system_msg = "You are a precise JSON-only risk analysis engine. Always respond with valid JSON and nothing else."
-
-    parsed = None
-    for attempt in range(2):
-        parsed = call_groq(system_msg, prompt, max_tokens=4096)
-        if not parsed:
-            print(f"Attempt {attempt}: call_groq returned None")
-            continue
-
-        required = ["summary", "risk_level", "risk_register"]
-        if not all(k in parsed for k in required):
-            print(f"Attempt {attempt}: Missing keys: {list(parsed.keys())}")
-            parsed = None
-            continue
-
-        parsed.setdefault("key_insights", [])
-        parsed.setdefault("recommendations", [])
-
-        if isinstance(parsed.get("risk_register", {}), dict):
-            break
-        print(f"Attempt {attempt}: risk_register is not a dict")
-        parsed = None
-
-    if not parsed:
-        return None
-
-    parsed["_avg_distance"] = avg_distance
-    return parsed
-
-
-# Agent 2: Scope & Planning Analyst
-SCOPE_PROMPT = """You are an expert project scope and planning analyst.
-
-Document content:
-\"\"\"
-{text}
-\"\"\"
-
-Return ONLY valid JSON matching this structure exactly:
-{{
-  "scope": {{
-    "objectives": ["list of project objectives"],
-    "boundaries": ["what is out of scope"],
-    "assumptions": ["key assumptions"]
-  }},
-  "deliverables": [
-    {{"name": "...", "description": "...", "priority": "high|medium|low", "status": "identified", "evidence": "...", "confidence": <0-100>}}
-  ],
-  "blockers": [
-    {{"description": "...", "severity": "critical|high|medium|low", "impact": "...", "mitigation": "...", "evidence": "...", "confidence": <0-100>}}
-  ],
-  "schedule_forecast": {{
-    "risk_level": "high|medium|low",
-    "delay_factors": ["list of factors that could cause delays"],
-    "recommendations": ["how to mitigate schedule risks"],
-    "reasoning": "Explain the forecast based on evidence"
-  }}
-}}
-
-Rules:
-- Never invent blockers. If none are supported by evidence, return one blocker: {{"description": "No blockers detected.", "severity": "low", "impact": "None", "mitigation": "None", "evidence": "No evidence of blockers.", "confidence": 100}}.
-- Forecast schedule ONLY when evidence exists. If milestones or deadlines are missing, set delay_factors to ["Schedule cannot be predicted."] and reasoning to "Missing milestone information."
-"""
-
-
-def agent_scope_planning(text: str) -> Optional[dict]:
-    if not HAS_GROQ:
-        return None
-    retrieved_text, _ = retrieve_context(text, k=4)
-    prompt = SCOPE_PROMPT.format(text=retrieved_text)
-    system_msg = "You are a precise JSON-only scope and planning engine. Return ONLY valid JSON."
-    return call_groq(system_msg, prompt)
-
-
-# Agent 3: Health Analyst
-HEALTH_PROMPT = """You are a Project Health Analyst AI. Assess the project's health across different dimensions based on the text.
-
-Document content:
-\"\"\"
-{text}
-\"\"\"
-
-Return ONLY valid JSON matching this structure exactly:
-{{
-  "health_breakdown": {{
-    "planning": {{"score": <0-100>, "reason": "...", "evidence": "...", "confidence": <0-100>}},
-    "documentation": {{"score": <0-100>, "reason": "...", "evidence": "...", "confidence": <0-100>}},
-    "development": {{"score": <0-100>, "reason": "...", "evidence": "...", "confidence": <0-100>}},
-    "testing": {{"score": <0-100>, "reason": "...", "evidence": "...", "confidence": <0-100>}}
-  }}
-}}
-
-Rules:
-- Every score must explain Why, cite Evidence, and provide a Confidence level.
-- If a dimension (e.g. testing) is not mentioned in the text, set score to 0, confidence to 0, and reason to "No evidence found in current documents."
-"""
-
-
-def agent_health(text: str) -> Optional[dict]:
-    if not HAS_GROQ:
-        return None
-    retrieved_text, _ = retrieve_context(text, k=3)
-    prompt = HEALTH_PROMPT.format(text=retrieved_text)
-    system_msg = "You are a precise JSON-only health scoring engine. Return ONLY valid JSON."
-
-    parsed = None
-    for attempt in range(2):
-        parsed = call_groq(system_msg, prompt)
-        if not parsed:
-            continue
-        if isinstance(parsed.get("health_breakdown", {}), dict):
-            break
-    return parsed
-
-
-# Agent 4: Traceability & Missing Docs
-TRACE_PROMPT = """You are a project auditor and scrum master. Analyze the document for traceability, missing documentation, and sprint analysis.
-
-Document content:
-\"\"\"
-{text}
-\"\"\"
-
-Return ONLY valid JSON matching this structure exactly:
-{{
-  "missing_documentation": [
-    {{"document_type": "...", "reason": "Why it is missing but implied", "confidence": <0-100>}}
-  ],
-  "traceability_gaps": [
-    {{"requirement": "...", "missing_link": "Task|Testing|Deployment", "reasoning": "...", "satisfied": false}}
-  ],
-  "sprint_analysis": {{
-    "sprint_goals": ["..."],
-    "completed_work": ["..."],
-    "pending_work": ["..."],
-    "velocity": "...",
-    "risks": ["..."],
-    "action_items": ["..."],
-    "status": "Detected | Missing"
-  }},
-  "document_summary": {{
-    "document_type": "...",
-    "purpose": "...",
-    "primary_domain": "...",
-    "detected_technologies": ["..."],
-    "quality_score": <0-100>,
-    "overall_assessment": "..."
-  }}
-}}
-
-Rules:
-- If sprint data/artifacts are not detected, set sprint_analysis.status to "Sprint artifacts not detected." and leave arrays empty.
-- Every traceability gap MUST include "satisfied": false. Only set it true if the requirement is fully traced.
-- Never hallucinate traceability gaps if the document is too brief.
-"""
-
-
-def agent_traceability(text: str) -> Optional[dict]:
-    if not HAS_GROQ:
-        return None
-    retrieved_text, _ = retrieve_context(text, k=3)
-    prompt = TRACE_PROMPT.format(text=retrieved_text)
-    system_msg = "You are an audit agent. Return ONLY valid JSON."
-    return call_groq(system_msg, prompt)
-
-
-# Agent 5: Meeting Minutes
-MEETING_PROMPT = """You are an AI meeting assistant. Extract meeting minutes, decisions, and action items.
-
-Document content:
-\"\"\"
-{text}
-\"\"\"
-
-Return ONLY valid JSON matching this structure exactly. If this is not a meeting document, return an empty string for meeting_minutes and empty arrays.
-{{
-  "meeting_minutes": "Brief summary of the meeting topics",
-  "decisions": ["Key decision 1", "Key decision 2"],
-  "action_items": [
-    {{"task": "What needs to be done", "owner": "Who is responsible, or 'Unassigned'", "deadline": "When it is due, or 'Unknown'"}}
-  ]
-}}"""
-
-
-def agent_meeting(text: str) -> Optional[dict]:
-    if not HAS_GROQ:
-        return None
-    retrieved_text, _ = retrieve_context(text, k=3)
-    prompt = MEETING_PROMPT.format(text=retrieved_text)
-    system_msg = "You are a meeting analysis agent. Return ONLY valid JSON."
-    return call_groq(system_msg, prompt)
-
-
-# Agent 6: User Story Writer — generates the documentation the project is missing
-STORY_PROMPT = """You are an agile business analyst. Convert the requirements and features described in this document into user stories.
-
-Document content:
-\"\"\"
-{text}
-\"\"\"
-
-Return ONLY valid JSON matching this structure exactly:
-{{
-  "user_stories": [
-    {{
-      "id": "US-1",
-      "epic": "Epic or feature area this belongs to",
-      "story": "As a [role], I want to [action] so that [benefit]",
-      "acceptance_criteria": ["Given/When/Then criterion 1", "criterion 2"],
-      "priority": "high|medium|low",
-      "evidence": "The requirement text this was derived from",
-      "confidence": <0-100>
-    }}
-  ]
-}}
-
-Rules:
-- Derive stories ONLY from requirements, features or capabilities actually described in the document.
-- If the document contains no requirements at all, return {{"user_stories": []}}.
-- Produce at most 12 stories, prioritising the most substantial requirements.
-"""
-
-
-def agent_user_stories(text: str) -> Optional[dict]:
-    if not HAS_GROQ:
-        return None
-    retrieved_text, _ = retrieve_context(text, k=4)
-    prompt = STORY_PROMPT.format(text=retrieved_text)
-    system_msg = "You are an agile analyst. Return ONLY valid JSON."
-    return call_groq(system_msg, prompt, max_tokens=3000)
-
-
-# ── Orchestrator ──────────────────────────────────────────────────────────────
 RISK_CATEGORIES = ["technical", "timeline", "financial", "operational", "legal"]
 
-# Every agent is one Groq call. Running all six on every upload triples the
-# rate-limit pressure on the free tier for no benefit — a task-list CSV has no
-# meeting minutes to extract, and a set of meeting notes rarely contains
-# formal requirements. These signals decide which optional agents to run.
-# Set RUN_ALL_AGENTS=1 to force the full pipeline regardless.
-RUN_ALL_AGENTS = os.getenv("RUN_ALL_AGENTS", "").strip().lower() in {"1", "true", "yes"}
-
-MEETING_SIGNALS = [
-    "agenda", "attendees", "attended", "minutes", "meeting", "discussed",
-    "action item", "action items", "next steps", "stand-up", "standup",
-    "retrospective", "retro", "sync", "call notes", "present:", "apologies",
-    "decision", "decided", "follow-up", "follow up", "sprint review",
-]
-
-REQUIREMENT_SIGNALS = [
-    "shall", "must", "requirement", "requirements", "srs", "user story",
-    "user stories", "acceptance criteria", "feature", "features", "functional",
-    "non-functional", "use case", "scope", "deliverable", "specification",
-    "the system", "epic", "backlog", "as a user",
-]
-
-
-def _signal_count(text: str, signals: list) -> int:
-    """How many distinct signal phrases appear. Cheap, deterministic, no LLM."""
-    sample = (text or "")[:20000].lower()
-    return sum(1 for phrase in signals if phrase in sample)
-
-
-def looks_like_meeting_notes(text: str) -> bool:
-    return _signal_count(text, MEETING_SIGNALS) >= 2
-
-
-def has_requirements(text: str) -> bool:
-    return _signal_count(text, REQUIREMENT_SIGNALS) >= 3
-
-
 def _normalise_register(risks) -> dict:
-    """
-    Coerce whatever the LLM returned into the five-category dict, and stamp each
-    risk with the category key it was filed under.
-
-    Previously a risk whose own "category" field disagreed with its bucket was
-    silently dropped from the saved register. Now the bucket wins, so no
-    evidence is lost.
-    """
     register = {c: [] for c in RISK_CATEGORIES}
-
     if isinstance(risks, list):
         for r in risks:
-            if not isinstance(r, dict):
-                continue
+            if not isinstance(r, dict): continue
             cat = str(r.get("category", "technical")).lower()
-            if cat not in register:
-                cat = "technical"
+            if cat not in register: cat = "technical"
             r["category"] = cat
             register[cat].append(r)
         return register
-
     if isinstance(risks, dict):
         for key, items in risks.items():
             cat = str(key).lower()
-            if cat not in register or not isinstance(items, list):
-                continue
+            if cat not in register or not isinstance(items, list): continue
             for r in items:
-                if not isinstance(r, dict):
-                    continue
-                r["category"] = cat   # bucket is authoritative
+                if not isinstance(r, dict): continue
+                r["category"] = cat
                 register[cat].append(r)
     return register
 
 
-def run_agent_pipeline(text: str, tasks: Optional[list] = None,
-                       run_stories: bool = True,
-                       force_all_agents: bool = False) -> dict:
+def run_agent_pipeline(text: str, tasks: Optional[list] = None, force_all_agents: bool = False) -> dict:
     """
-    Orchestrate every agent over the supplied text.
-
-    `tasks` is structured task data (from a CSV upload or from the project's
-    milestones). When present, the schedule forecast is computed with real date
-    arithmetic and the LLM narrative is merged on top.
+    Slim 2-call pipeline that fits in Render free tier:
+    Call 1: Risk + Health + Scope objectives
+    Call 2: Blockers + Traceability + Document summary
     """
-    risk_result = analyze_with_groq(text)
+    # ── Call 1: Main analysis ─────────────────────────────────────────────────
+    analysis = None
     used_fallback = False
-    if not risk_result:
-        # Groq unavailable — run the real keyword engine rather than giving up.
-        risk_result = keyword_engine.analyze(text)
-        risk_result["_avg_distance"] = 0.0
+    if HAS_GROQ:
+        prompt1 = FULL_ANALYSIS_PROMPT.format(text=text[:8000])
+        analysis = call_groq(
+            "You are a precise JSON-only analysis engine. Return ONLY valid JSON.",
+            prompt1,
+            max_tokens=3000,
+        )
+
+    if not analysis:
+        analysis = keyword_engine.analyze(text)
+        analysis["_avg_distance"] = 0.0
+        analysis.setdefault("scope", {"objectives": [], "boundaries": [], "assumptions": []})
+        analysis.setdefault("deliverables", [])
+        analysis.setdefault("health_breakdown", {})
         used_fallback = True
 
-    agents_run = ["risk"]
-    agents_skipped = []
+    # ── Call 2: Blockers + Traceability ──────────────────────────────────────
+    scope2 = {}
+    if HAS_GROQ and not used_fallback:
+        prompt2 = SCOPE_PROMPT.format(text=text[:8000])
+        scope2 = call_groq(
+            "You are a precise JSON-only project auditor. Return ONLY valid JSON.",
+            prompt2,
+            max_tokens=2000,
+        ) or {}
 
-    if used_fallback:
-        scope_result, trace_result, meeting_result, story_result = {}, {}, {}, {}
-        health_result = {"health_breakdown": {}}
-        agents_skipped = ["scope", "health", "traceability", "meeting", "user_stories"]
-    else:
-        scope_result = agent_scope_planning(text) or {}
-        health_result = agent_health(text) or {"health_breakdown": {}}
-        trace_result = agent_traceability(text) or {}
-        agents_run += ["scope", "health", "traceability"]
+    # ── Scoring ───────────────────────────────────────────────────────────────
+    avg_distance = analysis.pop("_avg_distance", 0.0)
+    register = _normalise_register(analysis.get("risk_register", {}))
+    insights = analysis.get("key_insights", [])
 
-        # Optional agents: skip the call when the document plainly has nothing
-        # for them, unless the caller asked for the full pipeline.
-        if RUN_ALL_AGENTS or force_all_agents or looks_like_meeting_notes(text):
-            meeting_result = agent_meeting(text) or {}
-            agents_run.append("meeting")
-        else:
-            meeting_result = {}
-            agents_skipped.append("meeting")
-
-        if run_stories and (RUN_ALL_AGENTS or force_all_agents or has_requirements(text)):
-            story_result = agent_user_stories(text) or {}
-            agents_run.append("user_stories")
-        else:
-            story_result = {}
-            agents_skipped.append("user_stories")
-
-    # ── Risk scoring ──────────────────────────────────────────────────────────
-    avg_distance = risk_result.pop("_avg_distance", 0.0)
-    register = _normalise_register(risk_result.get("risk_register", {}))
-    insights = risk_result.get("key_insights", [])
-
-    flat_risks = []
-    mapped_categories = {}
-    assessed_count = 0
-
+    flat_risks, mapped_categories, assessed_count = [], {}, 0
     for cat in RISK_CATEGORIES:
         cat_risks = register.get(cat, [])
-        # Every risk in the bucket is kept, whether or not it scores.
         flat_risks.extend(cat_risks)
         score = scoring.category_score(cat, cat_risks)
         mapped_categories[cat] = score
@@ -941,34 +386,10 @@ def run_agent_pipeline(text: str, tasks: Optional[list] = None,
             assessed_count += 1
 
     computed_risk_score = scoring.overall_risk_score(mapped_categories)
-    risk_coverage_info = {
-        "low_coverage": assessed_count < 3,
-        "categories_assessed": assessed_count,
-        "categories_total": 5
-    }
-
-    risk_result["risk_level"] = ("Unknown" if assessed_count == 0
-                                 else scoring.risk_band(computed_risk_score))
-    risk_result["risk_score"] = int(computed_risk_score)
-    risk_result["risk_register"] = flat_risks
-
-    # ── Confidence ────────────────────────────────────────────────────────────
-    if assessed_count == 0:
-        final_confidence = None
-    elif not insights:
-        final_confidence = round(scoring.insight_confidence(avg_distance, 0.2) * 100.0)
-    else:
-        conf_sum = 0.0
-        for ins in insights:
-            cw = scoring.confidence_weight(bool(ins.get("is_inferred")), bool(ins.get("evidence_quote")))
-            conf_sum += scoring.insight_confidence(avg_distance, cw)
-        final_confidence = round((conf_sum / len(insights)) * 100.0)
 
     # ── Health scoring ────────────────────────────────────────────────────────
-    hb = health_result.get("health_breakdown", {}) if isinstance(health_result, dict) else {}
-    if not isinstance(hb, dict):
-        hb = {}
-
+    hb = analysis.get("health_breakdown", {})
+    if not isinstance(hb, dict): hb = {}
     def axis(name):
         entry = hb.get(name)
         return entry.get("score") if isinstance(entry, dict) else None
@@ -980,57 +401,57 @@ def run_agent_pipeline(text: str, tasks: Optional[list] = None,
         "testing": axis("testing"),
         "risk": max(0, 100 - computed_risk_score) if computed_risk_score is not None else None,
     }
-
-    llm_axis_keys = ["planning", "documentation", "development", "testing"]
-    llm_health_assessed_count = sum(1 for k in llm_axis_keys if axis_scores.get(k) is not None)
     overall_health = scoring.overall_health(axis_scores)
     grade = scoring.grade(overall_health)
+    llm_health_count = sum(1 for k in ["planning","documentation","development","testing"] if axis_scores.get(k) is not None)
 
-    # ── Schedule forecast: deterministic first, LLM narrative second ──────────
+    # ── Schedule ──────────────────────────────────────────────────────────────
     computed_schedule = schedule_engine.forecast(tasks or [])
-    llm_schedule = scope_result.get("schedule_forecast", {})
-    schedule_forecast = schedule_engine.merge_with_llm(computed_schedule, llm_schedule)
+    schedule_forecast = schedule_engine.merge_with_llm(computed_schedule, {})
+
+    # ── Confidence ────────────────────────────────────────────────────────────
+    if assessed_count == 0:
+        final_confidence = None
+    elif not insights:
+        final_confidence = round(scoring.insight_confidence(avg_distance, 0.2) * 100.0)
+    else:
+        conf_sum = sum(
+            scoring.insight_confidence(avg_distance, scoring.confidence_weight(bool(i.get("is_inferred")), bool(i.get("evidence_quote"))))
+            for i in insights
+        )
+        final_confidence = round((conf_sum / len(insights)) * 100.0)
 
     # ── Merge ─────────────────────────────────────────────────────────────────
-    merged = {**risk_result}
-    merged["risk_score"] = round(computed_risk_score)
-    mapped_categories["_coverage"] = risk_coverage_info
-    merged["risk_categories"] = mapped_categories
+    merged = {**analysis}
+    merged["risk_score"]     = round(computed_risk_score) if computed_risk_score else 0
+    merged["risk_level"]     = "Unknown" if assessed_count == 0 else scoring.risk_band(computed_risk_score)
+    merged["risk_register"]  = flat_risks
+    merged["risk_categories"] = {**mapped_categories, "_coverage": {
+        "low_coverage": assessed_count < 3, "categories_assessed": assessed_count, "categories_total": 5
+    }}
     merged["confidence_score"] = final_confidence
     merged["project_health"] = {
         "score": round(overall_health),
         "grade": grade,
         "breakdown": hb,
-        "health_coverage": {
-            "low_coverage": llm_health_assessed_count < 3,
-            "categories_assessed": llm_health_assessed_count,
-            "categories_total": 4
-        }
+        "health_coverage": {"low_coverage": llm_health_count < 3, "categories_assessed": llm_health_count, "categories_total": 4}
     }
-
-    merged["scope"] = scope_result.get("scope", {"objectives": [], "boundaries": [], "assumptions": []})
-    merged["deliverables"] = scope_result.get("deliverables", [])
-    merged["blockers"] = scope_result.get("blockers", [])
+    merged["scope"]             = analysis.get("scope", {"objectives": [], "boundaries": [], "assumptions": []})
+    merged["deliverables"]      = analysis.get("deliverables", [])
     merged["schedule_forecast"] = schedule_forecast
-
-    merged["missing_documentation"] = trace_result.get("missing_documentation", [])
-    merged["traceability_gaps"] = trace_result.get("traceability_gaps", [])
-    merged["sprint_summary"] = trace_result.get("sprint_analysis", {})
-    merged["document_summary"] = trace_result.get("document_summary", {})
-
-    # Meeting agent — now actually invoked, so meeting notes produce output.
-    merged["meeting_minutes"] = meeting_result.get("meeting_minutes") or None
-    merged["decisions"] = meeting_result.get("decisions", [])
-    merged["action_items"] = meeting_result.get("action_items", [])
-
-    # User stories — generated as part of the pipeline, not only on demand.
-    merged["user_stories"] = story_result.get("user_stories", [])
-
-    merged["tasks"] = tasks or []
-    merged["agents_run"] = agents_run
-    merged["agents_skipped"] = agents_skipped
-    merged["analysis_source"] = "keyword_fallback" if used_fallback else "groq_pipeline"
-
+    merged["blockers"]          = scope2.get("blockers", [])
+    merged["missing_documentation"] = scope2.get("missing_documentation", [])
+    merged["traceability_gaps"] = scope2.get("traceability_gaps", [])
+    merged["document_summary"]  = scope2.get("document_summary", {})
+    merged["sprint_summary"]    = {}
+    merged["meeting_minutes"]   = None
+    merged["decisions"]         = []
+    merged["action_items"]      = []
+    merged["user_stories"]      = []
+    merged["tasks"]             = tasks or []
+    merged["agents_run"]        = ["risk+health+scope", "blockers+traceability"] if not used_fallback else ["keyword_fallback"]
+    merged["agents_skipped"]    = ["meeting", "user_stories"]
+    merged["analysis_source"]   = "keyword_fallback" if used_fallback else "groq_pipeline"
     return merged
 
 
@@ -1039,7 +460,7 @@ def run_agent_pipeline(text: str, tasks: Optional[list] = None,
 def health():
     return {
         "status": "running",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "groq_enabled": HAS_GROQ,
         "groq_model": GROQ_MODEL if HAS_GROQ else None,
         "pdf_extraction": HAS_PYMUPDF,
@@ -1048,322 +469,138 @@ def health():
     }
 
 
+@app.post("/analyze")
+async def analyze_file(
+    file: UploadFile = File(...),
+    projectId: Optional[str] = Form(None),
+    documentId: Optional[str] = Form(None),
+):
+    """Synchronous analysis — 2 Groq calls, completes in ~30-60s on free tier."""
+    start = time.time()
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{ext}'.")
+
+    file_bytes = await file.read()
+    extracted_text = extract_text(file_bytes, ext)
+    word_count = len(re.findall(r'\b\w+\b', extracted_text)) if extracted_text else 0
+
+    parsed_tasks = csv_tasks.parse_tasks(extracted_text)
+    tasks = parsed_tasks.get("tasks", [])
+    analysis_text = extracted_text
+    if tasks:
+        analysis_text = csv_tasks.tasks_to_text(parsed_tasks) + "\n\n" + extracted_text
+
+    result = run_agent_pipeline(analysis_text, tasks=tasks)
+    analysis_source = result.pop("analysis_source", "groq_pipeline" if HAS_GROQ else "keyword_fallback")
+
+    if projectId:
+        add_to_knowledge_base(projectId, extracted_text, documentId or str(uuid.uuid4()), file.filename)
+
+    response = {
+        "status": "success",
+        "filename": file.filename,
+        "projectId": projectId,
+        "documentId": documentId,
+        "word_count": word_count,
+        "processing_time_ms": round((time.time() - start) * 1000, 2),
+        "analysis_source": analysis_source,
+        "extracted_text": extracted_text[:5000],
+        "task_parse_status": parsed_tasks.get("parse_status"),
+    }
+    response.update(result)
+    return response
+
+
+# ── backward-compat process endpoint ─────────────────────────────────────────
 @app.post("/process")
 async def process_file(file: UploadFile = File(...), projectId: Optional[str] = None):
-    """v1 backward-compat endpoint."""
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Unsupported file type.")
     file_id = str(uuid.uuid4())
     path = UPLOAD_DIR / f"{file_id}_{Path(file.filename).name}"
-    with path.open("wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    content = await file.read()
+    path.write_bytes(content)
     return {"status": "success", "file_id": file_id, "filename": file.filename, "projectId": projectId}
 
-from fastapi import BackgroundTasks
 
-# Store task results in memory
-_tasks_db = {}
-
-def process_document_pipeline(task_id, file_bytes, ext, filename, projectId, documentId):
-    start = time.time()
-    try:
-        extracted_text = extract_text(file_bytes, ext)
-        word_count = len(re.findall(r'\b\w+\b', extracted_text)) if extracted_text else 0
-
-        parsed_tasks = csv_tasks.parse_tasks(extracted_text)
-        tasks = parsed_tasks.get("tasks", [])
-        analysis_text = extracted_text
-        if tasks:
-            analysis_text = csv_tasks.tasks_to_text(parsed_tasks) + "\n\n" + extracted_text
-        # Groq free tier has a strict 6,000 Tokens-Per-Minute limit.
-        # 12,000 characters is ~3,000 tokens. This prevents aggressive 429 rate limits.
-        safe_analysis_text = analysis_text[:12000] if analysis_text else ""
-
-        result = run_agent_pipeline(safe_analysis_text, tasks=tasks)
-        analysis_source = result.pop("analysis_source", "groq_pipeline" if HAS_GROQ else "keyword_fallback")
-
-        if projectId:
-            add_to_knowledge_base(
-                projectId,
-                extracted_text,
-                documentId or str(uuid.uuid4()),
-                filename,
-            )
-
-        processing_time_ms = round((time.time() - start) * 1000, 2)
-
-        response = {
-            "status": "success",
-            "filename": filename,
-            "projectId": projectId,
-            "documentId": documentId,
-            "word_count": word_count,
-            "processing_time_ms": processing_time_ms,
-            "analysis_source": analysis_source,
-            "extracted_text": extracted_text[:5000],
-            "task_parse_status": parsed_tasks.get("parse_status"),
-        }
-        response.update(result)
-        _tasks_db[task_id] = {"status": "completed", "result": response}
-    except Exception as e:
-        print(f"Background task failed for {filename}: {e}")
-        _tasks_db[task_id] = {"status": "failed", "error": str(e)}
-
-@app.post("/analyze")
-async def analyze_file(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    projectId: Optional[str] = Form(None),
-    documentId: Optional[str] = Form(None),
-):
-    """Core AI analysis endpoint — now uses background tasks to avoid Render proxy 100s timeouts."""
-    ext = Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-        )
-
-    file_bytes = await file.read()
-    task_id = str(uuid.uuid4())
-    _tasks_db[task_id] = {"status": "processing"}
-    
-    # Run heavy pipeline in background
-    background_tasks.add_task(
-        process_document_pipeline,
-        task_id, file_bytes, ext, file.filename, projectId, documentId
-    )
-    
-    return {"status": "processing", "task_id": task_id}
-
-@app.get("/task/{task_id}")
-def get_task_status(task_id: str):
-    """Check the status of a background analysis task."""
-    task = _tasks_db.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task
-
+# ── Project-level analysis ────────────────────────────────────────────────────
 class ProjectAnalyzeRequest(BaseModel):
     project_id: str
     milestones: Optional[List[dict]] = None
     context_override: Optional[str] = None
 
-
 @app.post("/analyze-project")
 def analyze_project(req: ProjectAnalyzeRequest):
-    """
-    Run the multi-agent pipeline across the WHOLE project knowledge base.
-
-    This is the project-level intelligence layer: instead of scoring one file at
-    a time, the agents reason over the combined artifacts, and the schedule
-    forecast uses the project's real milestones and dependencies.
-    """
     start = time.time()
-
     context_text, avg_distance, doc_names = build_project_context(req.project_id)
-
     if not context_text and req.context_override:
         context_text = req.context_override
         doc_names = ["Project documents (database)"]
     if not context_text:
-        raise HTTPException(
-            status_code=404,
-            detail="No project context found. Upload and analyse at least one document first."
-        )
+        raise HTTPException(status_code=404, detail="No project context found. Upload and analyse at least one document first.")
 
     tasks = []
     for m in (req.milestones or []):
         tasks.append({
-            "id": m.get("id"),
-            "name": m.get("name"),
-            "owner": m.get("owner") or "Unassigned",
-            "status": m.get("status") or "not_started",
-            "progress": m.get("progress", 0),
+            "id": m.get("id"), "name": m.get("name"), "owner": m.get("owner") or "Unassigned",
+            "status": m.get("status") or "not_started", "progress": m.get("progress", 0),
             "due_date": m.get("dueDate") or m.get("due_date"),
             "start_date": m.get("startDate") or m.get("start_date"),
             "depends_on": m.get("depends_on") or m.get("dependsOn") or [],
             "effort": m.get("effort"),
         })
 
-    # Render proxy timeout safeguard
-    safe_context_text = context_text[:40000] if context_text else ""
-
-    result = run_agent_pipeline(safe_context_text, tasks=tasks, force_all_agents=True)
+    result = run_agent_pipeline(context_text[:16000], tasks=tasks, force_all_agents=True)
     analysis_source = result.pop("analysis_source", "groq_pipeline")
-
     result.update({
-        "status": "success",
-        "project_id": req.project_id,
-        "source_documents": doc_names,
-        "documents_covered": len(doc_names),
-        "milestones_used": len(tasks),
-        "analysis_source": analysis_source,
+        "status": "success", "project_id": req.project_id,
+        "source_documents": doc_names, "documents_covered": len(doc_names),
+        "milestones_used": len(tasks), "analysis_source": analysis_source,
         "processing_time_ms": round((time.time() - start) * 1000, 2),
     })
     return result
 
 
+# ── Chat endpoint ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     project_id: str
     question: str
     history: Optional[List[dict]] = None
     context_override: Optional[str] = None
 
-
 @app.post("/chat")
 def chat(req: ChatRequest):
-    """Chat endpoint backed by the FAISS knowledge base, with conversation memory."""
     if not HAS_GROQ:
         raise HTTPException(status_code=503, detail="Groq API is required for chat.")
 
     chunks = query_knowledge_base(req.project_id, req.question, k=5)
-
     if not chunks and req.context_override:
         context_text = req.context_override
-        sources = [{
-            "text": req.context_override[:200] + "...",
-            "doc_id": "database",
-            "doc_name": "Project documents (database)",
-            "distance": 0
-        }]
+        sources = [{"text": req.context_override[:200] + "...", "doc_id": "database", "doc_name": "Project documents", "distance": 0}]
     elif not chunks:
-        return {
-            "answer": "I don't have enough context from this project's documents to answer that question.",
-            "sources": [],
-            "grounded": False
-        }
+        return {"answer": "I don't have enough context from this project's documents to answer that question.", "sources": [], "grounded": False}
     else:
-        context_text = "\n\n".join([f"[Source: {c['doc_name']}]\n{c['text']}" for c in chunks])
-        sources = chunks
+        context_text = "\n\n---\n\n".join(f"[Source: {c['doc_name']}]\n{c['text']}" for c in chunks)
+        sources = [{"doc_id": c["doc_id"], "doc_name": c["doc_name"], "text": c["text"][:200], "distance": c.get("distance", 0)} for c in chunks]
 
-    system_msg = (
-        "You are a project intelligence assistant. Answer questions ONLY based on the provided "
-        "document context. Cite the source document name when you use it. If the context doesn't "
-        "contain the answer, say so plainly. Earlier turns of the conversation are provided for "
-        "continuity — use them to resolve references like 'that risk' or 'the second one'."
+    system = (
+        "You are an AI project intelligence assistant. Answer based ONLY on the provided context. "
+        "Be concise and specific. If you cannot answer from the context, say so clearly."
     )
-    user_msg = f"Context:\n{context_text}\n\nQuestion: {req.question}"
-
-    # History is now part of the request model, so follow-up questions keep
-    # their thread instead of being answered cold.
-    history = (req.history or [])[-8:]
-
-    try:
-        answer = call_groq_text(system_msg, user_msg, max_tokens=1024,
-                                temperature=0.3, history=history)
-        return {"answer": answer, "sources": sources, "grounded": True}
-    except Exception as e:
-        print(f"Groq API failed during /chat: {e}")
-        return {
-            "answer": "AI is temporarily unavailable. Here are the most relevant excerpts from your "
-                      "documents for your question.",
-            "sources": sources,
-            "grounded": True
-        }
+    user_msg = f"Context:\n\n{context_text}\n\nQuestion: {req.question}"
+    answer = call_groq_text(system, user_msg, max_tokens=1024, temperature=0.3, history=req.history)
+    return {"answer": answer, "sources": sources, "grounded": bool(chunks)}
 
 
-class GenerateRequest(BaseModel):
-    project_id: str
-    doc_type: str
-    context_override: Optional[str] = None
-
-
-GENERATION_PROMPTS = {
-    "user_stories": "Synthesize all requirements, features, and scope from the context into a comprehensive Master User Story Backlog. Format as a Markdown document with clear Epics (H2) and User Stories (bullet points in format 'As a [role], I want to [action] so that [benefit]'). Include acceptance criteria if possible.",
-    "risk_register": "Synthesize all risks, warnings, blockers, and constraints from the context into a Master Risk Register. Format as a Markdown document with a summary, followed by a detailed table of risks (ID, Description, Category, Probability, Impact, Mitigation, Owner).",
-    "action_items": "Synthesize all pending tasks, next steps, and action items from the context into a Master Action Item List. Format as a Markdown document grouped by owner, with checkboxes and deadlines where known.",
-    "srs": "Synthesize all context into a formal Software Requirements Specification (SRS) outline. Include sections for: 1. Introduction & Purpose, 2. Overall Description, 3. System Features, 4. Non-Functional Requirements. Format as a clean Markdown document.",
-    "test_plan": "Synthesize the context into a Test Plan covering scope, test strategy, test cases traced to requirements, entry/exit criteria and known gaps. Format as clean Markdown.",
-    "status_report": "Synthesize the context into a concise project status report: overall health, what changed, risks needing attention, upcoming deadlines and asks. Format as clean Markdown.",
-    # The client offered this type while the service had no prompt for it, so
-    # it silently fell through to the generic executive-summary instruction.
-    "api_specs": "Synthesize the context into an API specification: for each endpoint give the method, path, purpose, request payload, response shape, auth requirement and error cases. Note explicitly where the documents do not specify a detail rather than inventing one. Format as clean Markdown with a table of endpoints followed by per-endpoint detail.",
-}
-
-
-@app.post("/generate")
-def generate_document(req: GenerateRequest):
-    """Generate missing documentation by synthesizing the project knowledge base."""
-    if not HAS_GROQ:
-        raise HTTPException(status_code=503, detail="Groq API is required for generation.")
-
-    chunks = query_knowledge_base(
-        req.project_id, "project overview requirements risks scope action items", k=10
-    )
-
-    if chunks:
-        context_text = "\n\n".join([f"[Source: {c['doc_name']}]\n{c['text']}" for c in chunks])
-    elif req.context_override:
-        context_text = req.context_override
-    else:
-        raise HTTPException(status_code=404, detail="No project context found to generate document.")
-
-    system_msg = ("You are an expert project manager and technical writer. Generate a comprehensive, "
-                  "professional document based ONLY on the provided project context. Output ONLY Markdown.")
-    task_prompt = GENERATION_PROMPTS.get(
-        req.doc_type, "Summarize the project context into a clear executive summary."
-    )
-    user_msg = f"Context:\n{context_text}\n\nTask: {task_prompt}"
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            content = call_groq_text(system_msg, user_msg, max_tokens=3000, temperature=0.2)
-            return {"markdown": content, "sources": [c["doc_name"] for c in chunks]}
-        except httpx.HTTPStatusError as e:
-            last_error = e
-            if e.response.status_code == 429 and attempt < 2:
-                print(f"Rate limit hit (429). Retrying in 5s (attempt {attempt + 1}/3)...")
-                time.sleep(5)
-            else:
-                break
-        except Exception as e:
-            last_error = e
-            if attempt < 2:
-                print(f"Error calling Groq: {e}. Retrying in 5s (attempt {attempt + 1}/3)...")
-                time.sleep(5)
-            else:
-                break
-
-    # Every retry failed — return the retrieved source material rather than an error.
-    print(f"Error in /generate: {last_error}")
-    fallback = "> AI synthesis is unavailable. These are the most relevant excerpts from your documents.\n\n"
-    if chunks:
-        fallback += "\n\n---\n\n".join([f"**From {c['doc_name']}:**\n\n{c['text']}" for c in chunks])
-    else:
-        fallback += context_text
-    return {"markdown": fallback, "sources": [c["doc_name"] for c in chunks]}
-
-
-# ── Knowledge base maintenance ────────────────────────────────────────────────
-@app.get("/kb/{project_id}")
-def kb_status(project_id: str):
-    """Report what the project knowledge base currently holds."""
-    _, index_path, chunks_path = _kb_paths(project_id)
-    chunks_meta = _load_chunks(chunks_path)
-    documents = {}
-    for c in chunks_meta:
-        name = c.get("doc_name", c.get("doc_id", "unknown"))
-        documents[name] = documents.get(name, 0) + 1
-    return {
-        "project_id": project_id,
-        "indexed": index_path.exists(),
-        "chunks": len(chunks_meta),
-        "documents": [{"name": n, "chunks": c} for n, c in documents.items()],
-    }
-
-
+# ── KB management endpoints ────────────────────────────────────────────────────
 @app.delete("/kb/{project_id}/document/{doc_id}")
-def kb_delete_document(project_id: str, doc_id: str):
-    """Remove one document's chunks when that document is deleted."""
+def delete_doc_from_kb(project_id: str, doc_id: str):
     removed = delete_document_from_kb(project_id, doc_id)
-    return {"project_id": project_id, "doc_id": doc_id, "chunks_removed": removed}
-
+    return {"status": "ok", "chunks_removed": removed}
 
 @app.delete("/kb/{project_id}")
-def kb_delete_project(project_id: str):
-    """Remove the whole knowledge base when a project is deleted."""
-    deleted = delete_project_kb(project_id)
-    return {"project_id": project_id, "deleted": deleted}
+def delete_project_knowledge_base(project_id: str):
+    ok = delete_project_kb(project_id)
+    return {"status": "ok" if ok else "not_found"}
